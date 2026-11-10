@@ -1,6 +1,5 @@
-"""Content-addressed caches under ``.proof-ci/`` (spec Sections 5.8 Step 5 and 5.9).
-
-M5 adds the collection cache. The result cache (M6) lands here too.
+"""Content-addressed caches under ``.proof-ci/``: the collection cache (spec Section 5.8
+Step 5) and the result cache (Section 5.9).
 """
 
 from __future__ import annotations
@@ -111,6 +110,9 @@ def collect_cache_key(
 ) -> str:
     test_files: dict[str, str] = {}
     for root in test_paths:
+        if (repo / root).is_file():  # a single test file listed directly
+            test_files[Path(root).as_posix()] = file_sha256(repo / root)
+            continue
         for rel in _walk(repo, repo / root, is_test_file):
             test_files[rel] = file_sha256(repo / rel)
     conftests = {

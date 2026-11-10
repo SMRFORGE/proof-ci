@@ -45,8 +45,10 @@ def demo(tmp_path: Path) -> Path:
 
 def run_all(repo: Path, *extra: str) -> dict[str, Any]:
     result = cli.invoke(app, ["run", "--all", "--json", "--repo", str(repo), *extra])
-    assert result.exit_code in (0, 1), result.output
     data: dict[str, Any] = json.loads(result.stdout)
+    # Exit 1 exactly when tests failed or errored, 0 otherwise.
+    failing = data["counts"]["failed"] + data["counts"]["error"]
+    assert result.exit_code == (1 if failing else 0), result.output
     return data
 
 

@@ -507,8 +507,10 @@ def run_dir_of(repo: Path, summary: dict[str, Any]) -> Path:
 
 def plain_run(repo: Path, *tests: str) -> dict[str, Any]:
     result = cli.invoke(app, ["run", *tests, "--json", "--repo", str(repo)])
-    assert result.exit_code in (0, 1), result.output
     data: dict[str, Any] = json.loads(result.stdout)
+    # Exit 1 exactly when tests failed or errored, 0 otherwise.
+    failing = data["counts"]["failed"] + data["counts"]["error"]
+    assert result.exit_code == (1 if failing else 0), result.output
     return data
 
 

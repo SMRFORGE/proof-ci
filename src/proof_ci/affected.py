@@ -9,7 +9,6 @@ files are read as text and parsed with :func:`ast.parse` only.
 from __future__ import annotations
 
 import ast
-import hashlib
 import re
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -22,17 +21,18 @@ __all__ = [
     "IGNORED_DIRS",
     "BaseResolution",
     "FallbackDecision",
+    "Hunk",
     "ImportGraph",
     "Selection",
     "changed_files",
+    "changed_hunks",
     "decide_fallback",
     "glob_match",
     "is_test_file",
-    "last_tree_path",
-    "read_last_tree",
+    "likely_cause",
+    "references_data_file",
     "resolve_base",
     "select",
-    "write_last_tree",
 ]
 
 IGNORED_DIRS = frozenset(
@@ -157,27 +157,6 @@ def glob_match(path: str, pattern: str) -> bool:
     return _glob_regex(pattern).match(path) is not None
 
 
-def last_tree_path(repo: Path, branch: str) -> Path:
-    """Stub used until the savings ledger exists (milestone M5 -> M9)."""
-    digest = hashlib.sha256(branch.encode("utf-8")).hexdigest()[:16]
-    return repo / ".proof-ci" / f"last-tree-{digest}.txt"
-
-
-def read_last_tree(repo: Path, branch: str) -> str | None:
-    path = last_tree_path(repo, branch)
-    try:
-        value = path.read_text(encoding="utf-8").strip()
-    except OSError:
-        return None
-    return value or None
-
-
-def write_last_tree(repo: Path, branch: str, tree: str) -> None:
-    path = last_tree_path(repo, branch)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(tree + "\n", encoding="utf-8", newline="\n")
-
-
 @dataclass(frozen=True)
 class FallbackDecision:
     fired: bool
@@ -215,6 +194,14 @@ def decide_fallback(
 
 
 # --------------------------------------------------------- Step 4: import graph
+
+
+def references_data_file(text: str, path: str) -> bool:
+    """Whether a test file's text names a data file by repo-relative path or basename.
+
+    Shared by selection (Step 6) and the result-cache key so the two cannot drift.
+    """
+    return path in text or PurePosixPath(path).name in text
 
 
 def is_test_file(path: str) -> bool:
@@ -437,11 +424,6 @@ class ImportGraph:
             queue.extend(self.rdeps.get(f, ()))
         return result
 
-    def affected_files(self, changed: Iterable[str]) -> set[str]:
-        """Changed files plus every transitive dependent, with dynamic-import conservatism."""
-        static, dynamic_only = self.affected_split(changed)
-        return static | dynamic_only
-
     def affected_split(self, changed: Iterable[str]) -> tuple[set[str], set[str]]:
         """(statically affected files, files affected only through the dynamic-import rule).
 
@@ -478,7 +460,6 @@ def _is_skippable_doc(path: str) -> bool:
 @dataclass(frozen=True)
 class Selection:
     selected: list[str]
-    affected_test_files: list[str]
     fallback: FallbackDecision
     unmatched_data_files: list[str]
     no_cache_files: frozenset[str] = frozenset()
@@ -494,8 +475,7 @@ def select(
 ) -> Selection:
     """Select collected items. ``collected`` is ``(test_id, file)`` pairs in collection order."""
     if fallback.fired:
-        files = sorted({f for _, f in collected})
-        return Selection([t for t, _ in collected], files, fallback, [])
+        return Selection([t for t, _ in collected], fallback, [])
 
     static, dynamic_only = graph.affected_split(changed)
     affected = static | dynamic_only
@@ -523,7 +503,6 @@ def select(
             or _is_skippable_doc(path)
         ):
             continue
-        basename = PurePosixPath(path).name
         hit = False
         for tf in test_files:
             if tf not in texts:
@@ -531,7 +510,7 @@ def select(
                     texts[tf] = (repo / tf).read_text(encoding="utf-8", errors="replace")
                 except OSError:
                     texts[tf] = ""
-            if path in texts[tf] or basename in texts[tf]:
+            if references_data_file(texts[tf], path):
                 affected.add(tf)
                 hit = True
         if not hit:
@@ -540,9 +519,7 @@ def select(
     selected_files = sorted(f for f in test_files if f in affected)
     keep = set(selected_files)
     no_cache = frozenset(f for f in selected_files if f in dynamic_only and f not in static)
-    return Selection(
-        [t for t, f in collected if f in keep], selected_files, fallback, unmatched, no_cache
-    )
+    return Selection([t for t, f in collected if f in keep], fallback, unmatched, no_cache)
 
 
 # ------------------------------------------------------------- likely cause

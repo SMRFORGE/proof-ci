@@ -297,6 +297,64 @@ def test_suspected_label(demo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         cli.invoke(app, ["run", "tests/test_flaky.py", "--no-cache", "--repo", str(demo)])
     monkeypatch.setenv("PROOF_CI_DEMO_FLAKE", "1")
     result = cli.invoke(app, ["run", "tests/test_flaky.py", "--no-cache", "--repo", str(demo)])
-    assert "FAILED (suspected flaky)" in result.stdout or "FAILED (known flaky)" in result.stdout
-    if "suspected" in result.stdout:
-        assert "known flaky" not in result.stdout
+    assert "FAILED (suspected flaky)" in result.stdout
+    assert "known flaky" not in result.stdout
+
+
+# --- code review (b42b1f4) regressions ---------------------------------------------
+
+
+def test_single_file_test_path_invalidates_collection_cache(demo: Path) -> None:
+    command = json.dumps([sys.executable, "-m", "pytest"])
+    write(
+        demo,
+        "proof-ci.toml",
+        f"[project]\ntest_command = {command}\n"
+        'test_paths = ["tests/test_text.py"]\n'
+        "[savings]\nrefresh_calibration_on_all = false\n",
+    )
+    _, first, _ = run(demo, "--all")
+    assert first["selection"]["collected_count"] == 2
+    with (demo / "tests/test_text.py").open("a", encoding="utf-8") as fh:
+        fh.write("\n\ndef test_new():\n    assert False\n")
+    code, second, _ = run(demo, "--all")
+    assert second["selection"]["collected_count"] == 3
+    assert code == 1
+
+
+def test_corrupt_database_is_a_runtime_error(demo: Path) -> None:
+    run(demo, "tests/test_text.py")
+    (demo / ".proof-ci" / "flakes.sqlite").write_bytes(b"this is not a database" * 100)
+    for args in (["flakes", "list"], ["run", "--all"]):
+        result = cli.invoke(app, [*args, "--repo", str(demo)])
+        assert result.exit_code == 3, (args, result.output)
+
+
+def test_unknown_explicit_node_id_is_a_usage_error(demo: Path) -> None:
+    result = cli.invoke(
+        app, ["run", "tests/test_math.py::test_does_not_exist", "--repo", str(demo)]
+    )
+    assert result.exit_code == 2, result.output
+
+
+def test_init_creates_key_where_signing_looks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "plain"
+    (repo / ".git").mkdir(parents=True)
+    key = tmp_path / "custom" / "signing.pem"
+    monkeypatch.setenv("PROOF_CI_SIGNING_KEY", str(key))
+    result = cli.invoke(app, ["init", "--json", "--repo", str(repo)])
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout)["key_created"] is True
+    assert key.is_file()
+
+
+def test_keygen_explicit_key_beats_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env_key = tmp_path / "env.pem"
+    monkeypatch.setenv("PROOF_CI_SIGNING_KEY", str(env_key))
+    explicit = tmp_path / "explicit.pem"
+    assert cli.invoke(app, ["record", "keygen", "--key", str(explicit)]).exit_code == 0
+    assert explicit.is_file() and not env_key.exists()

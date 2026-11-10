@@ -518,7 +518,10 @@ def _key_step(no_key: bool, config_dir: Path | None) -> tuple[bool, str | None, 
     if no_key:
         return False, "--no-key", None
     target = config_dir if config_dir is not None else user_config_dir()
-    key_path = target / "ed25519.pem"
+    # Signing reads PROOF_CI_SIGNING_KEY first, so create the key there when it is set.
+    env_key = os.environ.get("PROOF_CI_SIGNING_KEY")
+    key_path = Path(env_key) if env_key else target / "ed25519.pem"
+    target = key_path.parent
     if key_path.exists():
         return False, f"a signing key already exists at {key_path.as_posix()}", None
     try:

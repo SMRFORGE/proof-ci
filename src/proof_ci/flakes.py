@@ -104,10 +104,6 @@ class _Group:
     recent: tuple[str, ...]
     """Categories ("p"/"f") in time order."""
 
-    @property
-    def candidate_counts(self) -> tuple[int, int]:
-        return self.pass_count, self.fail_count
-
 
 @dataclass(frozen=True)
 class _Row:

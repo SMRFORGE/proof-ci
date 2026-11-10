@@ -62,7 +62,9 @@ class GitLabCISource:
                 else dangerous_reason("\n".join(lines), job.get("environment"))
             )
             if skip and name.lower().startswith("pages") and any(classify_line(x) for x in lines):
-                skip = None  # `pages` is still a job; keep it when its script runs tests
+                # `pages` is still a job; keep it when its script runs tests, unless the
+                # script itself does something dangerous.
+                skip = dangerous_reason("\n".join(lines), job.get("environment"))
             for line in lines:
                 confidence = classify_line(line)
                 if confidence is not None:

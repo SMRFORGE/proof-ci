@@ -1,9 +1,9 @@
 """Orchestrates one ``proof-ci run`` (spec Section 5.7.3).
 
 Modes: ``affected`` (default, Section 5.8), ``all``, ``explicit``, ``failed``.
-Collection and execution go through the pytest adapter; the run writes
-RunSummary, results.json, and last-run.json. The result cache (M6), flakes
-(M7), signing (M8), and savings (M9) plug in here later.
+Collection and execution go through the pytest adapter; the run consults the
+result cache, records flake history, computes savings, and writes RunSummary,
+results.json, and last-run.json.
 """
 
 from __future__ import annotations
@@ -17,7 +17,12 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Literal
 
 from proof_ci.adapters.agent.identity import resolve_identity
-from proof_ci.adapters.runners.pytest_runner import PytestRunner, RunnerError, RunOutput
+from proof_ci.adapters.runners.pytest_runner import (
+    PytestRunner,
+    RunnerError,
+    RunOutput,
+    UsageError,
+)
 from proof_ci.affected import (
     BaseResolution,
     FallbackDecision,
@@ -27,7 +32,7 @@ from proof_ci.affected import (
     changed_hunks,
     decide_fallback,
     likely_cause,
-    read_last_tree,
+    references_data_file,
     resolve_base,
     select,
 )
@@ -45,7 +50,7 @@ from proof_ci.cache import (
     trim_caches,
 )
 from proof_ci.config import Config, ConfigError
-from proof_ci.flakes import FlakeSnapshot, FlakeStore, code_hash
+from proof_ci.flakes import FlakeStore, code_hash
 from proof_ci.models import (
     CacheStats,
     Counts,
@@ -345,8 +350,6 @@ def plan_selection(
         tree_last = None
         if branch:
             tree_last = SavingsLedger(cfg.resolve(cfg.savings.db)).last_tree(branch)
-            if tree_last is None:  # M5 stub, migrated into the ledger on the next run
-                tree_last = read_last_tree(cfg.repo_root, branch)
         fallback = decide_fallback(
             cfg.repo_root,
             changed,
@@ -439,13 +442,10 @@ def compute_affected(cfg: Config, base: str | None) -> SelectionPlan:
     runner = PytestRunner(cfg.repo_root, cfg.project.test_command, work)
     try:
         return plan_selection(cfg, RunOptions(mode="affected", base=base), runner, info, case)
+    except UsageError as exc:
+        raise ConfigError(str(exc)) from exc
     except (GitError, RunnerError) as exc:
         raise RunError(str(exc)) from exc
-
-
-def cache_blocked_by_flakes(cfg: Config, test_id: str, snapshot: FlakeSnapshot) -> bool:
-    """True when ``test_id`` is suspected or confirmed flaky: never served from or written to cache."""
-    return snapshot.blocks_cache(test_id)
 
 
 def _flake_store(cfg: Config) -> FlakeStore:
@@ -514,7 +514,7 @@ class _KeyBuilder:
             except OSError:
                 text = ""
             for data in self._data_files:
-                if data in text or data.rsplit("/", 1)[-1] in text:
+                if references_data_file(text, data):
                     files.add(data)
             cached = {}
             for rel in files:
@@ -574,8 +574,9 @@ def _savings(
             platform=env.platform,
             run_id=str(summary.run_id),
         )
+    selected_set = set(plan.selected)
     deselected = (
-        [t for t in plan.collected_ids if t not in set(plan.selected)]
+        [t for t in plan.collected_ids if t not in selected_set]
         if plan.mode == "affected" and not plan.selection.fallback_full_run
         else []
     )
@@ -644,6 +645,8 @@ def execute_run(cfg: Config, options: RunOptions) -> RunOutcome:
     extra = _pytest_args(cfg, options.json_output)
     try:
         plan = plan_selection(cfg, options, runner, info, case)
+    except UsageError as exc:
+        raise ConfigError(str(exc)) from exc
     except (GitError, RunnerError) as exc:
         raise RunError(str(exc)) from exc
 
@@ -666,7 +669,7 @@ def execute_run(cfg: Config, options: RunOptions) -> RunOutcome:
         if keys is None or not read_cache:
             return found
         for test_id in plan.selected:
-            if cache_blocked_by_flakes(cfg, test_id, flakes_before):
+            if flakes_before.blocks_cache(test_id):
                 continue
             if plan.item_file[test_id] in plan.no_cache_files:
                 continue  # selected for a reason its cache key does not capture
@@ -736,6 +739,8 @@ def execute_run(cfg: Config, options: RunOptions) -> RunOutcome:
                 hits = {}
                 if stale:
                     execute(stale)
+    except UsageError as exc:
+        raise ConfigError(str(exc)) from exc
     except (GitError, RunnerError) as exc:
         raise RunError(str(exc)) from exc
 
@@ -771,9 +776,7 @@ def execute_run(cfg: Config, options: RunOptions) -> RunOutcome:
         # Replayed hits are never re-written and never enter flake history
         # (Section 5.9): only fresh executions feed both.
         for test_id, result in executed.items():
-            if result.outcome in CACHEABLE_OUTCOMES and not cache_blocked_by_flakes(
-                cfg, test_id, flakes_after
-            ):
+            if result.outcome in CACHEABLE_OUTCOMES and not flakes_after.blocks_cache(test_id):
                 key = keys.key(test_id, plan.item_file[test_id], env)
                 result_cache.put(key, result.to_json())
         trim_caches([result_cache.directory, cfg.resolve(cfg.cache.collect_cache_dir)])
@@ -867,8 +870,6 @@ def execute_run(cfg: Config, options: RunOptions) -> RunOutcome:
     # The interpreter that ran pytest, for RunRecord.payload.environment (M8).
     _write_json(run_dir / "environment.json", {"python": env.python, "platform": env.platform})
     _write_json(cfg.repo_root / STATE_DIR / "last-run.json", summary.to_json())
-    for stub in (cfg.repo_root / STATE_DIR).glob("last-tree-*.txt"):
-        stub.unlink(missing_ok=True)  # the ledger now holds the last tree per branch
 
     exit_code = 1 if blocking else 0
     return RunOutcome(

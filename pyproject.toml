@@ -15,7 +15,9 @@ dependencies = [
   "pydantic>=2.7",
   "pyyaml>=6.0",
   "platformdirs>=4.0",
-  "mcp>=1.2,<2",          # 2.x renamed FastMCP and changed import paths (spec Section 5.3)
+  "mcp>=1.10,<2",         # low-level Server with tuple (content, structured) results; 2.x reworked the server
+  "jsonschema>=4.20",     # MCP argument validation
+  "anyio>=4.5",           # MCP stdio server and worker threads
   "cryptography>=42.0",
   "rfc8785>=0.1",
 ]

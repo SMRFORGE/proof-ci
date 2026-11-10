@@ -48,7 +48,7 @@ flowchart TB
 
 ```
 .proof-ci/
-  cache/              result cache (passing results only)
+  cache/              result cache (passed, skipped, xfailed, xpassed; never failures)
   collect-cache/      cached pytest collection
   flakes.sqlite       outcome history and flake records
   savings.sqlite      savings ledger and calibration

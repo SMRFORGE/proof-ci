@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import sqlite3
 import sys
 import typing
 from collections.abc import Callable
@@ -169,7 +170,12 @@ def common_options(func: Callable[..., Any]) -> Callable[..., Any]:
             config=kwargs.pop("config", None),
         )
         kwargs[COMMON_PARAMETER_NAME] = common
-        return func(*args, **kwargs)
+        try:
+            return func(*args, **kwargs)
+        except (sqlite3.Error, OSError) as exc:
+            # Exit 1 means "tests failed"; an I/O or database failure is a runtime error.
+            typer.echo(f"error: {type(exc).__name__}: {exc}", err=True)
+            raise typer.Exit(EXIT_RUNTIME) from exc
 
     params = [*kept, *injected]
     wrapper.__signature__ = original.replace(  # type: ignore[attr-defined]
@@ -698,7 +704,8 @@ def record_keygen(
         cfg = load_config(common.repo, common.config)
     except ConfigError:
         cfg = None
-    path = resolve_key_path(cfg, key)
+    # For keygen an explicit --key wins; otherwise the signing precedence applies.
+    path = key if key is not None else resolve_key_path(cfg, None)
     try:
         pub = generate_keypair(path, force=force)
     except KeyError_ as exc:

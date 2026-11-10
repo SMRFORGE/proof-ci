@@ -62,7 +62,7 @@ jobs:
           python-version: ${{ matrix.python }}
       # The annotate plugin turns each failure into a public check annotation.
       - run: python -m pip install -e ".[dev]" pytest-github-actions-annotate-failures
-      - run: python -m pytest -q -rfE 2>&1 | tee pytest.log; exit "${PIPESTATUS[0]}"
+      - run: python -m pytest -q -rfE -n auto 2>&1 | tee pytest.log; exit "${PIPESTATUS[0]}"
       - name: Publish the end of the pytest output as an annotation
         if: failure()
         run: |

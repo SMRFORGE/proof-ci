@@ -43,8 +43,23 @@ def resolve_command(command: tuple[str, ...]) -> list[str]:
     return list(command)
 
 
+def _is_usage_error(proc: subprocess.CompletedProcess[str]) -> bool:
+    """pytest exit 4 covers both bad arguments and a broken conftest; only the first is ours.
+
+    Bad arguments (unknown option, a node id or path that does not exist) are a usage
+    error (exit 2). A conftest that fails to import stays a runtime error (exit 3).
+    """
+    text = (proc.stdout or "") + (proc.stderr or "")
+    markers = ("error: unrecognized arguments", "ERROR: not found:", "file or directory not found")
+    return any(m in text for m in markers) and proc.returncode in (4, 2)
+
+
 class RunnerError(Exception):
     """pytest or the plugin failed in a way that is a runtime error (exit 3)."""
+
+
+class UsageError(RunnerError):
+    """pytest rejected the requested tests or arguments (exit 2)."""
 
 
 @dataclass(frozen=True)
@@ -115,9 +130,13 @@ class PytestRunner:
     def _plugin_missing(self, proc: subprocess.CompletedProcess[str]) -> RunnerError:
         detail = (proc.stderr or proc.stdout or "").strip()
         cmd = " ".join(self.test_command)
-        if proc.returncode == 4 or "error: unrecognized arguments" in detail:
-            message = f"pytest rejected the collect command (usage error) for '{cmd}'"
-        elif "proof_ci" in detail or proc.returncode == 0:
+        if _is_usage_error(proc):
+            # Usage error, e.g. an explicit node id that does not exist: exit 2, not 3.
+            return UsageError(
+                f"pytest rejected the requested tests or arguments for '{cmd}' (usage error)"
+                + (f"\n{redact(detail[-2000:])}" if detail else "")
+            )
+        if "proof_ci" in detail or proc.returncode == 0:
             message = (
                 f"proof-ci's pytest plugin is not importable by '{cmd}'; "
                 "install proof-ci into the project's environment"
@@ -168,6 +187,11 @@ class PytestRunner:
         if data is None:
             raise self._plugin_missing(proc)
         # pytest exit code 5 = no tests collected; 0 = ok. Others mean a collection error.
+        if _is_usage_error(proc):
+            raise UsageError(
+                "pytest could not find the requested tests (usage error):\n"
+                + redact((proc.stdout + proc.stderr).strip()[-2000:])
+            )
         if proc.returncode not in (0, 5):
             raise RunnerError(
                 f"pytest collection failed (exit {proc.returncode}):\n{redact((proc.stdout + proc.stderr).strip()[-4000:])}"

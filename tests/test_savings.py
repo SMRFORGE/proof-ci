@@ -470,13 +470,9 @@ def test_tampered_payload_savings_fails_verify(
     assert r.exit_code == 4
 
 
-def test_ledger_replaces_last_tree_stub(demo: Path) -> None:
-    stub = demo / ".proof-ci" / "last-tree-0000000000000000.txt"
-    stub.parent.mkdir(parents=True, exist_ok=True)
-    stub.write_text("x\n", encoding="utf-8")
-    cli.invoke(
-        app, ["run", "--all", "--repo", str(demo)]
-    )  # an affected/all run honours the fallback
-    assert not stub.exists()
+def test_ledger_holds_last_tree_for_honouring_runs_only(demo: Path) -> None:
     ledger = SavingsLedger(demo / ".proof-ci" / "savings.sqlite")
+    cli.invoke(app, ["run", "tests/test_text.py", "--repo", str(demo)])  # explicit
+    assert ledger.last_tree("main") is None
+    cli.invoke(app, ["run", "--all", "--repo", str(demo)])  # honours the fallback
     assert ledger.last_tree("main") is not None
