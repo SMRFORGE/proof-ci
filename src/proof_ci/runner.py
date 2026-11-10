@@ -315,7 +315,11 @@ def _branch(repo: Path) -> str | None:
 
 
 def _collect(
-    cfg: Config, runner: PytestRunner, paths: list[str], use_cache: bool
+    cfg: Config,
+    runner: PytestRunner,
+    paths: list[str],
+    use_cache: bool,
+    tree: str | None = None,
 ) -> tuple[list[dict[str, Any]], CollectEntry | None, CollectEnv, list[dict[str, Any]]]:
     """Collect through the plugin, reusing the collection cache when its key matches.
 
@@ -328,7 +332,11 @@ def _collect(
         return out.items, None, env, out.errors
     cache = CollectCache(cfg.resolve(cfg.cache.collect_cache_dir))
     key = collect_cache_key(
-        cfg.repo_root, cfg.project.test_paths, cfg.project.pytest_args, cfg.project.test_command
+        cfg.repo_root,
+        cfg.project.test_paths,
+        cfg.project.pytest_args,
+        cfg.project.test_command,
+        tree,
     )
     entry = cache.get(key)
     if entry is not None:
@@ -391,7 +399,7 @@ def plan_selection(
         if options.mode == "explicit"
         else list(cfg.project.test_paths)
     )
-    items, entry, env, collect_errors = _collect(cfg, runner, paths, use_cache)
+    items, entry, env, collect_errors = _collect(cfg, runner, paths, use_cache, info.tree)
     collected_ids = [case.canonical_node_id(i["test_id"]) for i in items]
     invoke_id = {case.canonical_node_id(i["test_id"]): i["test_id"] for i in items}
     item_file = {case.canonical_node_id(i["test_id"]): case.canonical(i["file"]) for i in items}

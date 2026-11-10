@@ -40,6 +40,8 @@ __all__ = [
 IGNORED_DIRS = frozenset(
     {
         "__pycache__",
+        ".pytest_cache",
+        ".hypothesis",
         ".venv",
         "venv",
         "node_modules",

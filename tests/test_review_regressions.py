@@ -418,3 +418,22 @@ def test_argfile_skipped_for_short_lists_and_unsafe_ids(tmp_path: Path) -> None:
     out = _maybe_argfile(long, tmp_path, "x.txt")
     assert out == [f"@{tmp_path / 'x.txt'}"]
     assert _maybe_argfile([*long, "a\nb"], tmp_path, "y.txt")[-1] == "a\nb"
+
+
+def test_tree_hash_sees_a_same_size_rewrite_in_the_same_second(demo: Path) -> None:
+    from proof_ci.util import tree_hash
+
+    write(demo, "value.txt", "2\n")
+    past = (1_700_000_000, 1_700_000_000)
+    os.utime(demo / "value.txt", past)  # well before the index is written: not racy
+    git(demo, "add", "-A")
+    git(demo, "commit", "-q", "-m", "value")
+    committed = tree_hash(demo)
+    # Same size and the same mtime as the index entry: git's stat check alone cannot
+    # tell the rewrite apart (as with a rewrite within the same second).
+    write(demo, "value.txt", "3\n")
+    os.utime(demo / "value.txt", past)
+    assert tree_hash(demo) != committed
+    write(demo, "value.txt", "2\n")
+    os.utime(demo / "value.txt", past)
+    assert tree_hash(demo) == committed

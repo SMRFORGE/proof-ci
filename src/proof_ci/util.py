@@ -109,19 +109,19 @@ def is_git_repo(repo: Path) -> bool:
 
 def tree_hash(repo: Path) -> str:
     """Hash of the working tree as tested, without touching the real index (Section 4.7)."""
-    index = run_git(repo, "rev-parse", "--git-path", "index").stdout.strip()
-    index_path = Path(index)
-    if not index_path.is_absolute():
-        index_path = repo / index_path
     fd, tmp_name = tempfile.mkstemp(prefix="proof-ci-index-")
     os.close(fd)
     tmp = Path(tmp_name).resolve()
     try:
-        if index_path.exists():
-            shutil.copyfile(index_path, tmp)
-        else:
-            tmp.unlink()  # git creates a fresh index when the file is absent
+        tmp.unlink()  # git creates a fresh index when the file is absent
         env = {**os.environ, "GIT_INDEX_FILE": str(tmp)}
+        # Start from HEAD's tree with no stat data, never from a copy of the real index:
+        # a copied index can carry stat data that matches a file rewritten within the same
+        # second at the same size, and git would then trust the old blob (found by M13: an
+        # edited file hashed as the committed tree). With no stat data every file is
+        # re-hashed by content.
+        if run_git(repo, "rev-parse", "-q", "--verify", "HEAD^{tree}", check=False).returncode == 0:
+            run_git(repo, "read-tree", "HEAD", env=env)
         # proof-ci's own state is never part of the tested tree, ignored or not.
         run_git(repo, "add", "-A", env=env)
         run_git(repo, "rm", "-r", "-q", "--cached", "--ignore-unmatch", "--", ".proof-ci", env=env)

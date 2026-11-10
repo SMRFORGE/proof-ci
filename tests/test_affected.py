@@ -526,6 +526,26 @@ def test_collect_cache_key_sensitivity(demo: Path) -> None:
     assert collect_cache_key(demo, *args) != k1
 
 
+def test_collect_cache_key_follows_helpers_and_data_not_docs(demo: Path) -> None:
+    # Helper modules and data files drive parametrization (M13): they must invalidate
+    # the cached collection. Docs and pytest's own cache must not.
+    args: tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]] = (("tests",), (), ("pytest",))
+
+    def key() -> str:
+        return collect_cache_key(demo, *args, tree_hash(demo))
+
+    k1 = key()
+    (demo / ".pytest_cache").mkdir(exist_ok=True)
+    (demo / ".pytest_cache" / "lastfailed").write_text("{}", encoding="utf-8")
+    _append(demo, "README.md", "\nmore docs\n")
+    assert key() == k1
+    _append(demo, "tests/data/sample.json", " ")
+    k2 = key()
+    assert k2 != k1
+    _append(demo, "src/demo/textops.py", "\n# helper edit\n")
+    assert key() != k2
+
+
 # ------------------------------------------------------------ case canonical
 
 

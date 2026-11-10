@@ -102,11 +102,48 @@ def pytest_config_file(repo: Path) -> Path | None:
     return None
 
 
+_DOC_SUFFIXES = (".md", ".rst", ".txt")
+
+
+def repo_content_digest(repo: Path, tree: str | None = None) -> str:
+    """Digest of every file in the tested tree except docs and ignored directories.
+
+    Collection depends on more than test files: helper modules and data files drive
+    parametrization, and modules a test imports at collection time can fail (M13).
+    ``tree`` is the working-tree hash from :func:`proof_ci.util.tree_hash` (content-hashed,
+    so a same-size rewrite within one second is still seen); its blob ids are the digest
+    input. Without a tree (outside git) the result is empty and the per-file parts apply.
+    """
+    if not tree:
+        return ""
+    from proof_ci.util import GitError, run_git
+
+    try:
+        proc = run_git(repo, "ls-tree", "-r", "-z", tree, check=False)
+    except GitError:
+        return ""
+    if proc.returncode != 0:
+        return ""
+    entries: dict[str, str] = {}
+    for record in proc.stdout.split("\0"):
+        meta, _, path = record.partition("\t")
+        fields = meta.split()
+        if (
+            path
+            and len(fields) >= 3
+            and not any(part in IGNORED_DIRS for part in path.split("/")[:-1])
+            and not path.lower().endswith(_DOC_SUFFIXES)
+        ):
+            entries[path] = fields[2]
+    return hashlib.sha256(rfc8785.dumps(entries)).hexdigest()
+
+
 def collect_cache_key(
     repo: Path,
     test_paths: tuple[str, ...],
     pytest_args: tuple[str, ...],
     test_command: tuple[str, ...],
+    tree: str | None = None,
 ) -> str:
     test_files: dict[str, str] = {}
     for root in test_paths:
@@ -126,6 +163,7 @@ def collect_cache_key(
         "pytest_config": file_sha256(config) if config is not None else "",
         "pytest_args": list(pytest_args),
         "test_command": list(test_command),
+        "repo_content": repo_content_digest(repo, tree),
     }
     return hashlib.sha256(rfc8785.dumps(document)).hexdigest()
 
