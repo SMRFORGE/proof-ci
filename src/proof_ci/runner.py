@@ -422,7 +422,7 @@ def _flake_store(cfg: Config) -> FlakeStore:
     )
 
 
-def _check_run(out: RunOutput, ids: list[str], invoke_id: dict[str, str]) -> None:
+def _check_run(out: RunOutput, ids: list[str], case: CaseIndex) -> None:
     # pytest exit codes 2 (interrupted), 3 (internal error), 4 (usage error):
     # whatever results exist are partial, so do not present them as a run.
     if out.returncode in (2, 3, 4):
@@ -430,8 +430,10 @@ def _check_run(out: RunOutput, ids: list[str], invoke_id: dict[str, str]) -> Non
             f"pytest exited {out.returncode} (interrupted, internal or usage error):\n"
             + (out.stdout + out.stderr)[-4000:]
         )
-    reported = {raw["test_id"] for raw in out.results}
-    missing = [t for t in ids if invoke_id[t] not in reported]
+    # Compare canonical ids: on case-insensitive filesystems pytest may report a node
+    # id in the file's on-disk case rather than the spelling it was invoked with.
+    reported = {case.canonical_node_id(raw["test_id"]) for raw in out.results}
+    missing = [t for t in ids if t not in reported]
     if missing:
         raise RunError(
             f"pytest did not report {len(missing)} selected test(s), e.g. {missing[0]}; "
@@ -637,7 +639,7 @@ def execute_run(cfg: Config, options: RunOptions) -> RunOutcome:
         started_pytest = time.monotonic()
         out = runner.run([plan.invoke_id[t] for t in ids], extra)
         pytest_ms += round((time.monotonic() - started_pytest) * 1000)
-        _check_run(out, ids, plan.invoke_id)
+        _check_run(out, ids, case)
         stdout_parts.append(out.stdout)
         for raw in out.results:
             data = _canonicalise(raw, case)

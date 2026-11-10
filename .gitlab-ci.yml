@@ -1,6 +1,7 @@
 # Equivalent to .github/workflows/ci.yml for a GitLab mirror. Linux only: Windows
 # and macOS coverage comes from the GitHub matrix. Runs on whichever runners the
-# hosting group provides; no secrets, no publishing.
+# hosting group provides (untagged jobs: a self-hosted group runner with
+# run_untagged picks them up; shared runners are not assumed). No secrets, no publishing.
 
 default:
   before_script:

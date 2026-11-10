@@ -6,6 +6,7 @@ These tests must pass on Linux, macOS, and native Windows (spec Section 5.20).
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -134,10 +135,14 @@ def test_common_options_helper_injects_three_options() -> None:
     assert negated.exit_code == 0, negated.output
     assert seen["opts"].json_output is False
 
-    help_result = runner.invoke(test_app, ["--help"])
+    # CI terminals get rich formatting; force plain, wide output and strip any ANSI codes.
+    help_result = runner.invoke(
+        test_app, ["--help"], env={"NO_COLOR": "1", "TERM": "dumb", "COLUMNS": "200"}
+    )
     assert help_result.exit_code == 0
+    plain = re.sub(r"\x1b\[[0-9;]*m", "", help_result.stdout)
     for flag in ("--json", "--no-json", "--repo", "--config"):
-        assert flag in help_result.stdout
+        assert flag in plain
 
 
 def test_common_options_requires_common_parameter() -> None:
