@@ -656,6 +656,7 @@ def test_failing_run_keeps_exit_1_when_signing_fails(
 def test_verify_reports_trust_source(demo: Path, keyfile: Path) -> None:
     _, record_path = signed_run(demo)
     code, out = verify(str(record_path), "--pubkey", str(keyfile) + ".pub")
+    assert code == 0
     assert out["trust_source"] == "--pubkey"
     config = demo / "proof-ci.toml"
     config.write_text(
