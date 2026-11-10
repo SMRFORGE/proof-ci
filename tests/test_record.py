@@ -421,6 +421,10 @@ def test_parse_sddl_allow_list() -> None:
     deny_only = f"D:PAI(D;;FA;;;WD)(A;;FA;;;{user})"
     assert rec._unsafe_sids(rec._parse_sddl(deny_only), user) == []
     assert rec._parse_sddl("garbage") == []
+    # The built-in Administrator account appears as the alias LA (GitHub's Windows runners).
+    admin_user = "S-1-5-21-1-2-3-500"
+    assert rec._unsafe_sids(rec._parse_sddl("D:PAI(A;;FA;;;LA)"), admin_user) == []
+    assert rec._unsafe_sids(rec._parse_sddl("D:PAI(A;;FA;;;LA)"), user) == ["LA"]
 
 
 def test_unreadable_acl_warns(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

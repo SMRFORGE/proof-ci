@@ -223,6 +223,12 @@ def _parse_sddl(sddl: str) -> list[tuple[str, str]]:
 def _unsafe_sids(aces: list[tuple[str, str]], user_sid: str) -> list[str]:
     """Allow-list: any granting ACE for a SID other than the user/SYSTEM/Administrators."""
     allowed = _ALLOWED_SIDS | {user_sid}
+    # Machine-relative SDDL aliases: icacls prints "LA"/"LG" for the local Administrator
+    # (RID 500) and Guest (RID 501) accounts instead of their SIDs. They are the current
+    # user only when the user's own SID ends in that RID (e.g. CI runners run as LA).
+    for alias, rid in (("LA", "-500"), ("LG", "-501")):
+        if user_sid.endswith(rid):
+            allowed = allowed | {alias}
     return sorted({sid for typ, sid in aces if typ in ("A", "OA") and sid not in allowed})
 
 
