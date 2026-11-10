@@ -971,3 +971,14 @@ def discover_cmd(*, common: CommonOptions) -> None:
         typer.echo(f"[{c.confidence}] {c.source_path} :: {c.job_name}: {c.command}{note}")
     if result.best:
         typer.echo(f"Suggested test_command = {json.dumps(result.best)}")
+
+
+@app.command("mcp")
+def mcp_cmd() -> None:
+    """Start the MCP server on stdio (no TCP port; stdout is the MCP transport)."""
+    import anyio
+
+    from proof_ci.adapters.agent.mcp_server import serve
+
+    typer.echo("proof-ci MCP server starting on stdio", err=True)
+    anyio.run(serve)

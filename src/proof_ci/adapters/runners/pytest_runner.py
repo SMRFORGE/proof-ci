@@ -99,6 +99,7 @@ class PytestRunner:
         try:
             return subprocess.run(
                 argv,
+                stdin=subprocess.DEVNULL,  # never share the caller's stdin (MCP transport)
                 cwd=self.repo_root,
                 env=env,
                 capture_output=True,
@@ -129,6 +130,7 @@ class PytestRunner:
         try:
             proc = subprocess.run(
                 [*resolve_command(self.test_command), "--version"],
+                stdin=subprocess.DEVNULL,  # never share the caller's stdin (MCP transport)
                 cwd=self.repo_root,
                 capture_output=True,
                 encoding="utf-8",

@@ -63,6 +63,8 @@ def run_git(
             env=env,
             check=False,
             input=stdin,
+            # Never let git share the caller's stdin (it is the MCP transport).
+            stdin=subprocess.DEVNULL if stdin is None else None,
         )
     except OSError as exc:
         raise GitError(f"cannot run git: {exc}") from exc

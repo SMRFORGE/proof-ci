@@ -155,6 +155,7 @@ def _current_user_sid() -> str | None:
         return None
     proc = subprocess.run(
         [exe, "/user", "/fo", "csv", "/nh"],
+        stdin=subprocess.DEVNULL,  # never share the caller's stdin (MCP transport)
         capture_output=True,
         encoding="utf-8",
         errors="replace",
@@ -180,6 +181,7 @@ def _protect_windows(path: Path) -> None:
     target = f"*{sid}" if sid else _windows_user()
     proc = subprocess.run(
         [exe, str(path), "/inheritance:r", "/grant:r", f"{target}:F"],
+        stdin=subprocess.DEVNULL,  # never share the caller's stdin (MCP transport)
         capture_output=True,
         encoding="utf-8",
         errors="replace",
@@ -237,6 +239,7 @@ def _windows_unsafe_principals(path: Path) -> list[str] | None:
         tmp.unlink()  # icacls /save refuses to overwrite in some versions
         proc = subprocess.run(
             [exe, str(path), "/save", str(tmp), "/q"],
+            stdin=subprocess.DEVNULL,  # never share the caller's stdin (MCP transport)
             capture_output=True,
             encoding="utf-8",
             errors="replace",
@@ -264,7 +267,9 @@ def _mount_fstype(path: Path) -> str | None:
                     if len(parts) >= 3:
                         entries.append((parts[1].replace("\\040", " "), parts[2]))
         elif sys.platform == "darwin":
-            out = subprocess.run(["mount"], capture_output=True, text=True, check=False).stdout
+            out = subprocess.run(
+                ["mount"], capture_output=True, text=True, check=False, stdin=subprocess.DEVNULL
+            ).stdout
             for line in out.splitlines():
                 m = re.match(r"^.+? on (.+?) \(([^,)]+)", line)
                 if m:
