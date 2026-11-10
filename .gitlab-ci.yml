@@ -1,0 +1,32 @@
+# Equivalent to .github/workflows/ci.yml for a GitLab mirror. Linux only: Windows
+# and macOS coverage comes from the GitHub matrix. Runs on whichever runners the
+# hosting group provides; no secrets, no publishing.
+
+default:
+  before_script:
+    - python -m pip install -e ".[dev]"
+
+lint:
+  image: python:3.13
+  script:
+    - ruff check src tests
+    - ruff format --check src tests
+
+typecheck:
+  image: python:3.13
+  script:
+    - mypy
+
+importlint:
+  image: python:3.13
+  script:
+    - lint-imports
+    - python -m pytest -q tests/test_import_lint.py
+
+test:
+  image: python:${PYTHON}
+  parallel:
+    matrix:
+      - PYTHON: ["3.11", "3.12", "3.13"]
+  script:
+    - python -m pytest -q
