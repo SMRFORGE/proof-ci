@@ -1,0 +1,84 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "proof-ci"
+version = "0.1.0"
+description = "Agent-native CI layer: fast, structured, local-first checks for coding agents."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+authors = [{ name = "Chris Whalen" }]
+dependencies = [
+  "typer>=0.12",
+  "pydantic>=2.7",
+  "pyyaml>=6.0",
+  "platformdirs>=4.0",
+  "mcp>=1.2,<2",          # 2.x renamed FastMCP and changed import paths (spec Section 5.3)
+  "cryptography>=42.0",
+  "rfc8785>=0.1",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+  "pytest-cov>=5.0",
+  "ruff>=0.6",
+  "mypy>=1.10",
+  "import-linter>=2.0",
+]
+
+[project.scripts]
+proof-ci = "proof_ci.cli:app"
+
+# No [project.entry-points.pytest11]: the plugin is loaded explicitly with
+# `-p proof_ci.pytest_plugin` by the runner (Section 5.10). An entry point would
+# autoload the plugin into every pytest run on the machine and would register
+# the module twice when the runner also passes -p.
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/proof_ci"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+packages = ["proof_ci"]
+
+[tool.importlinter]
+root_package = "proof_ci"
+
+[[tool.importlinter.contracts]]
+name = "core_must_not_import_vendor_sdks"
+type = "forbidden"
+source_modules = [
+  "proof_ci.affected",
+  "proof_ci.cache",
+  "proof_ci.cli",
+  "proof_ci.config",
+  "proof_ci.flakes",
+  "proof_ci.models",
+  "proof_ci.record",
+  "proof_ci.redact",
+  "proof_ci.runner",
+  "proof_ci.savings",
+  "proof_ci.util",
+]
+forbidden_modules = [
+  "github",
+  "gitlab",
+  "atlassian",
+  "msrest",
+  "azure",
+  "anthropic",
+  "openai",
+]
+# Adapter packages may import vendor SDKs. The MCP protocol library is allowed
+# only from proof_ci.adapters.agent (see Section 3.5).
