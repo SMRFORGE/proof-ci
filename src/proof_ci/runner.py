@@ -1,9 +1,9 @@
 """Orchestrates one ``proof-ci run`` (spec Section 5.7.3).
 
-M4 scope: modes ``all``, ``explicit``, and ``failed``; collection and execution
-through the pytest adapter; RunSummary, results.json, and last-run.json.
-Affected selection (M5), cache (M6), flakes (M7), signing (M8), and savings
-(M9) plug in here later.
+Modes: ``affected`` (default, Section 5.8), ``all``, ``explicit``, ``failed``.
+Collection and execution go through the pytest adapter; the run writes
+RunSummary, results.json, and last-run.json. The result cache (M6), flakes
+(M7), signing (M8), and savings (M9) plug in here later.
 """
 
 from __future__ import annotations
@@ -11,11 +11,26 @@ from __future__ import annotations
 import json
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal
 
 from proof_ci.adapters.runners.pytest_runner import PytestRunner, RunnerError, RunOutput
+from proof_ci.affected import (
+    BaseResolution,
+    FallbackDecision,
+    Hunk,
+    ImportGraph,
+    changed_files,
+    changed_hunks,
+    decide_fallback,
+    likely_cause,
+    read_last_tree,
+    resolve_base,
+    select,
+    write_last_tree,
+)
+from proof_ci.cache import CollectCache, CollectEntry, collect_cache_key
 from proof_ci.config import Config, ConfigError
 from proof_ci.models import (
     CacheStats,
@@ -25,11 +40,19 @@ from proof_ci.models import (
     Selection,
     TestResult,
 )
-from proof_ci.util import CaseIndex, GitError, git_info, utc_now_iso
+from proof_ci.util import CaseIndex, GitError, GitInfo, debug, git_info, run_git, utc_now_iso
 
-__all__ = ["RunError", "RunOptions", "RunOutcome", "execute_run"]
+__all__ = [
+    "RunError",
+    "RunOptions",
+    "RunOutcome",
+    "SelectionPlan",
+    "compute_affected",
+    "execute_run",
+    "plan_selection",
+]
 
-Mode = Literal["all", "explicit", "failed"]
+Mode = Literal["affected", "all", "explicit", "failed"]
 
 STATE_DIR = ".proof-ci"
 
@@ -43,6 +66,8 @@ class RunOptions:
     mode: Mode
     tests: tuple[str, ...] = ()
     json_output: bool = False
+    base: str | None = None
+    no_cache: bool = False
 
 
 @dataclass(frozen=True)
@@ -51,6 +76,7 @@ class RunOutcome:
     results: list[TestResult]
     exit_code: int
     pytest_stdout: str
+    notes: list[str] = field(default_factory=list)
 
 
 def _validate_test_args(cfg: Config, tests: tuple[str, ...]) -> None:
@@ -132,11 +158,203 @@ def _write_json(path: Path, data: Any) -> None:
         fh.write("\n")
 
 
+# ------------------------------------------------------------------ selection
+
+
+@dataclass
+class SelectionPlan:
+    """Everything selection decided before any test executes."""
+
+    mode: Mode
+    collected_ids: list[str]
+    invoke_id: dict[str, str]
+    item_file: dict[str, str]
+    selected: list[str]
+    selection: Selection
+    changed: list[str]
+    base: BaseResolution | None
+    hunks: dict[str, list[Hunk]]
+    branch: str | None
+    collect_entry: CollectEntry | None
+    notes: list[str] = field(default_factory=list)
+
+
+def _branch(repo: Path) -> str | None:
+    try:
+        proc = run_git(repo, "rev-parse", "--abbrev-ref", "HEAD", check=False)
+    except GitError:
+        return None
+    if proc.returncode != 0:
+        return None
+    return proc.stdout.strip() or None
+
+
+def _collect(
+    cfg: Config, runner: PytestRunner, paths: list[str], use_cache: bool
+) -> tuple[list[dict[str, Any]], CollectEntry | None]:
+    """Collect through the plugin, reusing the collection cache when its key matches.
+
+    Returns the items and, when they came from the cache, the cache entry.
+    """
+    if not use_cache:
+        return runner.collect(paths).items, None
+    cache = CollectCache(cfg.resolve(cfg.cache.collect_cache_dir))
+    key = collect_cache_key(
+        cfg.repo_root, cfg.project.test_paths, cfg.project.pytest_args, cfg.project.test_command
+    )
+    entry = cache.get(key)
+    if entry is not None:
+        debug("collection: cached")
+        return entry.items, entry
+    debug("collection: fresh")
+    out = runner.collect(paths)
+    cache.put(
+        CollectEntry(
+            key=key,
+            python=out.python,
+            platform=out.platform,
+            inipath=out.inipath,
+            installed=out.installed,
+            items=out.items,
+            written_at=time.time(),
+        )
+    )
+    return out.items, None
+
+
+def plan_selection(
+    cfg: Config,
+    options: RunOptions,
+    runner: PytestRunner,
+    info: GitInfo,
+    case: CaseIndex,
+) -> SelectionPlan:
+    """Spec Section 5.8 Steps 1-6 (and the other modes). Raises ConfigError/GitError/RunnerError."""
+    in_git = info.sha is not None
+    if options.mode == "affected" and not in_git:
+        raise ConfigError(
+            "affected selection needs a git repository with at least one commit; "
+            "use `proof-ci run --all` or pass TESTS"
+        )
+
+    base: BaseResolution | None = None
+    changed: list[str] = []
+    hunks: dict[str, list[Hunk]] = {}
+    if in_git:
+        setting = options.base or cfg.affected.base
+        try:
+            base = resolve_base(cfg.repo_root, setting, bool(info.dirty))
+        except GitError as exc:
+            if options.mode == "affected" or options.base:
+                raise ConfigError(str(exc)) from exc
+        if base is not None:
+            changed = changed_files(cfg.repo_root, base.base_ref)
+            hunks = changed_hunks(cfg.repo_root, base.base_ref, changed)
+
+    use_cache = cfg.cache.enabled and not options.no_cache and options.mode != "explicit"
+    paths = list(options.tests) if options.mode == "explicit" else list(cfg.project.test_paths)
+    items, entry = _collect(cfg, runner, paths, use_cache)
+    collected_ids = [case.canonical_node_id(i["test_id"]) for i in items]
+    invoke_id = {case.canonical_node_id(i["test_id"]): i["test_id"] for i in items}
+    item_file = {case.canonical_node_id(i["test_id"]): case.canonical(i["file"]) for i in items}
+
+    branch = _branch(cfg.repo_root) if in_git else None
+    fallback = FallbackDecision(False, None)
+    notes: list[str] = []
+    if options.mode == "affected":
+        tree_last = read_last_tree(cfg.repo_root, branch) if branch else None
+        fallback = decide_fallback(
+            cfg.repo_root,
+            changed,
+            cfg.affected.fallback_full_run_globs,
+            tree_now=info.tree,
+            tree_last=tree_last,
+        )
+        graph = ImportGraph.build(
+            cfg.repo_root, cfg.project.source_roots, cfg.project.test_paths, changed
+        )
+        chosen = select(
+            cfg.repo_root, changed, [(t, item_file[t]) for t in collected_ids], graph, fallback
+        )
+        selected = chosen.selected
+        for path in chosen.unmatched_data_files:
+            debug(f"changed non-Python file {path} is not referenced by any test file")
+    elif options.mode == "failed":
+        previous = set(_previous_failed(cfg))
+        selected = [t for t in collected_ids if t in previous]
+    else:
+        selected = collected_ids
+
+    sel_kwargs: dict[str, Any] = {}
+    if base is not None:
+        sel_kwargs.update(
+            base_setting=base.base_setting,
+            base_ref=base.base_ref,
+            changed_files=changed,
+            fallback_full_run=fallback.fired,
+            fallback_reason=fallback.reason,
+        )
+        if fallback.suppressed_by_tree:
+            sel_kwargs["fallback_suppressed_by_tree"] = fallback.suppressed_by_tree
+    selection = Selection(
+        mode=options.mode,
+        selected_count=len(selected),
+        collected_count=len(collected_ids),
+        deselected_count=len(collected_ids) - len(selected),
+        **sel_kwargs,
+    )
+    if options.mode == "affected" and not selected and base is not None:
+        state = "dirty" if info.dirty else "clean"
+        notes.append(
+            f"nothing affected: diffed against {base.base_setting} -> {base.base_ref[:12]} "
+            f"({len(changed)} changed file(s)); working tree is {state}"
+        )
+    return SelectionPlan(
+        mode=options.mode,
+        collected_ids=collected_ids,
+        invoke_id=invoke_id,
+        item_file=item_file,
+        selected=selected,
+        selection=selection,
+        changed=changed,
+        base=base,
+        hunks=hunks,
+        branch=branch,
+        collect_entry=entry,
+        notes=notes,
+    )
+
+
+def _git_state(cfg: Config) -> tuple[GitInfo, CaseIndex]:
+    try:
+        info = git_info(cfg.repo_root)
+    except GitError as exc:
+        raise RunError(str(exc)) from exc
+    case = CaseIndex.from_repo(cfg.repo_root) if info.sha is not None else CaseIndex([])
+    return info, case
+
+
+def compute_affected(cfg: Config, base: str | None) -> SelectionPlan:
+    """``proof-ci affected``: selection only, never runs tests."""
+    info, case = _git_state(cfg)
+    work = cfg.repo_root / STATE_DIR / "runs" / "affected"
+    work.mkdir(parents=True, exist_ok=True)
+    runner = PytestRunner(cfg.repo_root, cfg.project.test_command, work)
+    try:
+        return plan_selection(cfg, RunOptions(mode="affected", base=base), runner, info, case)
+    except (GitError, RunnerError) as exc:
+        raise RunError(str(exc)) from exc
+
+
+# ------------------------------------------------------------------------ run
+
+
 def execute_run(cfg: Config, options: RunOptions) -> RunOutcome:
     """Run the selected tests and write the run artifacts. Raises ConfigError (2) or RunError (3)."""
     if options.mode == "explicit":
         _validate_test_args(cfg, options.tests)
-    previous_failed = set(_previous_failed(cfg)) if options.mode == "failed" else set()
+    if options.mode == "failed":
+        _previous_failed(cfg)  # exit 2 early when there is no previous run
 
     started = utc_now_iso()
     t0 = time.monotonic()
@@ -144,45 +362,21 @@ def execute_run(cfg: Config, options: RunOptions) -> RunOutcome:
     run_dir = cfg.repo_root / STATE_DIR / "runs" / str(run_id)
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    try:
-        info = git_info(cfg.repo_root)
-    except GitError as exc:
-        raise RunError(str(exc)) from exc
-    case = (
-        CaseIndex.from_repo(cfg.repo_root) if info.sha is not None or info.tree else CaseIndex([])
-    )
-
+    info, case = _git_state(cfg)
     runner = PytestRunner(cfg.repo_root, cfg.project.test_command, run_dir)
     extra = _pytest_args(cfg, options.json_output)
     try:
-        collect_paths = (
-            list(options.tests) if options.mode == "explicit" else list(cfg.project.test_paths)
-        )
-        # Collection is serial and does not take pytest_args (spec Section 5.7.3 step 2).
-        collected = runner.collect(collect_paths)
-        collected_ids = [case.canonical_node_id(item["test_id"]) for item in collected.items]
-        # Keep pytest's own spelling for invocation; canonical ids for contracts.
-        invoke_id = {case.canonical_node_id(i["test_id"]): i["test_id"] for i in collected.items}
-
-        if options.mode == "failed":
-            selected = [t for t in collected_ids if t in previous_failed]
-        else:
-            selected = collected_ids
-
+        plan = plan_selection(cfg, options, runner, info, case)
         run_out: RunOutput | None = None
-        if selected:
-            run_out = runner.run([invoke_id[t] for t in selected], extra)
-    except RunnerError as exc:
+        if plan.selected:
+            run_out = runner.run([plan.invoke_id[t] for t in plan.selected], extra)
+    except (GitError, RunnerError) as exc:
         raise RunError(str(exc)) from exc
 
     results: list[TestResult] = []
     pytest_stdout = ""
     if run_out is not None:
         pytest_stdout = run_out.stdout
-        for raw in run_out.results:
-            data = _canonicalise(raw, case)
-            data["cache_hit"] = False
-            results.append(TestResult.model_validate(data))
         # pytest exit codes 2 (interrupted), 3 (internal error), 4 (usage error):
         # whatever results exist are partial, so do not present them as a run.
         if run_out.returncode in (2, 3, 4):
@@ -191,17 +385,31 @@ def execute_run(cfg: Config, options: RunOptions) -> RunOutcome:
                 + (run_out.stdout + run_out.stderr)[-4000:]
             )
         reported = {raw["test_id"] for raw in run_out.results}
-        missing = [t for t in selected if invoke_id[t] not in reported]
+        missing = [t for t in plan.selected if plan.invoke_id[t] not in reported]
         if missing:
             raise RunError(
                 f"pytest did not report {len(missing)} selected test(s), e.g. {missing[0]}; "
                 "check pytest_args for options that deselect tests"
             )
-        if not results and run_out.returncode not in (0, 5):
-            raise RunError(
-                f"pytest exited {run_out.returncode} without results:\n{(run_out.stderr or run_out.stdout)[-4000:]}"
-            )
+        base_ref = plan.base.base_ref if plan.base else ""
+        for raw in run_out.results:
+            data = _canonicalise(raw, case)
+            data["cache_hit"] = False
+            failure = data.get("failure")
+            if failure is not None and plan.hunks:
+                cause = likely_cause(failure.get("traceback", ""), plan.hunks, base_ref)
+                if cause is not None:
+                    data["failure"] = {**failure, "likely_cause": cause}
+            results.append(TestResult.model_validate(data))
         (run_dir / "pytest-stdout.txt").write_text(pytest_stdout, encoding="utf-8", newline="\n")
+        # Environment consistency (Section 5.8 Step 5): a cached collection entry
+        # whose interpreter no longer matches the live one is discarded.
+        entry = plan.collect_entry
+        if entry is not None and (entry.python, entry.platform) != (
+            run_out.python,
+            run_out.platform,
+        ):
+            CollectCache(cfg.resolve(cfg.cache.collect_cache_dir)).delete(entry.key)
 
     duration_ms = round((time.monotonic() - t0) * 1000)
     counts = _counts(results)
@@ -230,23 +438,23 @@ def execute_run(cfg: Config, options: RunOptions) -> RunOutcome:
     if info.dirty is not None:
         summary_kwargs["working_tree_dirty"] = info.dirty
 
+    nothing_affected = plan.mode == "affected" and not plan.selected
     summary = RunSummary(
         schema_version="1.0.0",
         run_id=run_id,
         started_at=started,
         finished_at=utc_now_iso(),
         duration_ms=duration_ms,
-        selection=Selection(
-            mode=options.mode,
-            selected_count=len(selected),
-            collected_count=len(collected_ids),
-            deselected_count=len(collected_ids) - len(selected),
-        ),
+        selection=plan.selection,
         # TODO(M6): the result cache. Until then every selected test is a miss.
-        cache=CacheStats(hits=0, misses=len(selected), disabled=True),
+        cache=CacheStats(hits=0, misses=len(plan.selected), disabled=True),
         counts=counts,
         outcome=outcome,
-        summary=_summary_text(counts, duration_ms, len(selected)),
+        summary=(
+            "0 selected, 0 failed (nothing affected)"
+            if nothing_affected
+            else _summary_text(counts, duration_ms, len(plan.selected))
+        ),
         failures=failures,
         results_path=_rel(cfg, results_path),
         record_path=None,
@@ -255,8 +463,15 @@ def execute_run(cfg: Config, options: RunOptions) -> RunOutcome:
     _write_json(results_path, [r.to_json() for r in results])
     _write_json(run_dir / "summary.json", summary.to_json())
     _write_json(cfg.repo_root / STATE_DIR / "last-run.json", summary.to_json())
+    if plan.branch and info.tree:
+        # TODO(M9): the savings ledger replaces this stub (spec milestone M5).
+        write_last_tree(cfg.repo_root, plan.branch, info.tree)
 
     exit_code = 1 if (counts.failed or counts.error) else 0
     return RunOutcome(
-        summary=summary, results=results, exit_code=exit_code, pytest_stdout=pytest_stdout
+        summary=summary,
+        results=results,
+        exit_code=exit_code,
+        pytest_stdout=pytest_stdout,
+        notes=plan.notes,
     )

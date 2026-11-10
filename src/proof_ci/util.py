@@ -10,6 +10,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -19,6 +20,7 @@ __all__ = [
     "CaseIndex",
     "GitError",
     "GitInfo",
+    "debug",
     "git_info",
     "git_preflight",
     "run_git",
@@ -29,6 +31,12 @@ __all__ = [
 
 class GitError(Exception):
     """git is missing, too old, or failed. Callers map it to exit 3 when git is required."""
+
+
+def debug(message: str) -> None:
+    """Write a diagnostic line to stderr when ``PROOF_CI_DEBUG=1``."""
+    if os.environ.get("PROOF_CI_DEBUG") == "1":
+        sys.stderr.write(f"proof-ci debug: {message}\n")
 
 
 def utc_now_iso() -> str:

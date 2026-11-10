@@ -280,51 +280,127 @@ def run(
         list[str] | None,
         typer.Argument(metavar="TESTS", help="pytest node ids or file paths (explicit mode)."),
     ] = None,
+    base: Annotated[
+        str | None,
+        typer.Option("--base", metavar="REF", help="Diff base: auto (default), HEAD, or a ref."),
+    ] = None,
     all_tests: Annotated[bool, typer.Option("--all", help="Run every collected test.")] = False,
     failed: Annotated[
         bool, typer.Option("--failed", help="Re-run the previous run's failed and errored tests.")
     ] = False,
+    no_cache: Annotated[
+        bool, typer.Option("--no-cache", help="Bypass the result and collection caches.")
+    ] = False,
+    sign: Annotated[bool, typer.Option("--sign", help="Sign a RunRecord for this run.")] = False,
     *,
     common: CommonOptions,
 ) -> None:
-    """Run tests through pytest and write a structured RunSummary."""
+    """Run the tests affected by the current change (or --all / --failed / TESTS)."""
     from proof_ci.runner import RunError, RunOptions, execute_run
 
     explicit = tuple(tests or ())
-    chosen = sum(bool(x) for x in (explicit, all_tests, failed))
-    if chosen > 1:
+    if sum(bool(x) for x in (explicit, all_tests, failed)) > 1:
         raise _fail("--all, --failed, and TESTS are mutually exclusive", EXIT_USAGE)
-    if chosen == 0:
-        raise _fail(
-            "affected-test selection arrives in milestone M5; use --all, --failed, or TESTS for now",
-            EXIT_USAGE,
-        )
-    mode: Literal["all", "explicit", "failed"] = (
-        "explicit" if explicit else "all" if all_tests else "failed"
+    mode: Literal["affected", "all", "explicit", "failed"] = (
+        "explicit" if explicit else "all" if all_tests else "failed" if failed else "affected"
     )
     try:
         cfg = load_config(common.repo, common.config)
         outcome = execute_run(
-            cfg, RunOptions(mode=mode, tests=explicit, json_output=common.json_output)
+            cfg,
+            RunOptions(
+                mode=mode,
+                tests=explicit,
+                json_output=common.json_output,
+                base=base,
+                no_cache=no_cache,
+            ),
         )
     except ConfigError as exc:
         raise _fail(str(exc), EXIT_USAGE) from exc
     except RunError as exc:
         raise _fail(str(exc), EXIT_RUNTIME) from exc
 
+    for note in outcome.notes:
+        typer.echo(note, err=True)
     summary = outcome.summary
+    sign_refused: str | None = None
+    if sign:
+        # A green record must mean at least one test was checked (Section 5.8 Step 7).
+        if summary.selection.selected_count == 0:
+            sign_refused = "cannot sign a run that selected no tests"
+        else:
+            # TODO(M8): build, sign, and write the RunRecord here.
+            sign_refused = "signing arrives in milestone M8; the run was not signed"
+
     if common.json_output:
         emit_json(summary.to_json())
     else:
         sel = summary.selection
         typer.echo(f"proof-ci run ({sel.mode}): {summary.summary}")
         typer.echo(f"Checked {sel.selected_count}/{sel.collected_count} tests.")
+        if sel.fallback_full_run:
+            typer.echo(sel.fallback_reason or "full run (fallback)")
         for f in summary.failures:
             where = f"{f.file}:{f.line}" if f.line else f.file
             typer.echo(f"FAILED {f.test_id} ({where})")
-            typer.echo(
-                f"  {f.error_type}: {f.error_message.splitlines()[0] if f.error_message else ''}"
-            )
+            first = f.error_message.splitlines()[0] if f.error_message else ""
+            typer.echo(f"  {f.error_type}: {first}")
             typer.echo(f"  repro: {f.repro_command}")
         typer.echo(f"Results: {summary.results_path}")
+    if sign_refused is not None:
+        raise _fail(sign_refused, EXIT_USAGE)
     raise typer.Exit(outcome.exit_code)
+
+
+@app.command()
+@common_options
+def affected(
+    base: Annotated[
+        str | None,
+        typer.Option("--base", metavar="REF", help="Diff base: auto (default), HEAD, or a ref."),
+    ] = None,
+    output_format: Annotated[
+        str,
+        typer.Option(
+            "--format",
+            help="ids (node ids), files (selected test files), or json.",
+        ),
+    ] = "ids",
+    *,
+    common: CommonOptions,
+) -> None:
+    """List the tests affected by the current change. Never runs tests."""
+    from proof_ci.runner import RunError, compute_affected
+
+    if output_format not in ("ids", "files", "json"):
+        raise _fail("--format must be ids, files, or json", EXIT_USAGE)
+    try:
+        cfg = load_config(common.repo, common.config)
+        plan = compute_affected(cfg, base)
+    except ConfigError as exc:
+        raise _fail(str(exc), EXIT_USAGE) from exc
+    except RunError as exc:
+        raise _fail(str(exc), EXIT_RUNTIME) from exc
+
+    for note in plan.notes:
+        typer.echo(note, err=True)
+    sel = plan.selection
+    if common.json_output or output_format == "json":
+        emit_json(
+            {
+                "base_setting": sel.base_setting,
+                "base_ref": sel.base_ref,
+                "changed_files": plan.changed,
+                "selected_tests": plan.selected,
+                "fallback_full_run": bool(sel.fallback_full_run),
+                "fallback_reason": sel.fallback_reason,
+            }
+        )
+        return
+    if output_format == "files":
+        for path in dict.fromkeys(plan.item_file[t] for t in plan.selected):
+            typer.echo(path)
+        return
+    for test_id in plan.selected:
+        typer.echo(test_id)

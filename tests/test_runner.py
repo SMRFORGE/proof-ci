@@ -132,10 +132,10 @@ def test_modes_are_mutually_exclusive(demo: Path, args: list[str]) -> None:
     assert invoke("run", *args, "--repo", str(demo)).exit_code == 2
 
 
-def test_affected_mode_not_yet_available(demo: Path) -> None:
+def test_affected_mode_outside_git_exits_2(demo: Path) -> None:
     result = invoke("run", "--repo", str(demo))
     assert result.exit_code == 2
-    assert "M5" in result.stderr
+    assert "git repository" in result.stderr
 
 
 def test_zero_selected_does_not_invoke_pytest(demo: Path) -> None:
