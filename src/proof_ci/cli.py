@@ -13,16 +13,17 @@ from __future__ import annotations
 import inspect
 import json
 import sys
+import typing
 from collections.abc import Callable
 from dataclasses import dataclass
 from functools import wraps
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 import typer
 
 from proof_ci import __version__
-from proof_ci.config import ConfigError, InitIOError, find_repo_root, init_repo
+from proof_ci.config import ConfigError, InitIOError, find_repo_root, init_repo, load_config
 
 __all__ = [
     "EXIT_RUNTIME",
@@ -123,7 +124,14 @@ def common_options(func: Callable[..., Any]) -> Callable[..., Any]:
             f"{COMMON_PARAMETER_NAME!r} to receive CommonOptions"
         )
 
-    kept = [p for p in original.parameters.values() if p.name != COMMON_PARAMETER_NAME]
+    # Resolve string annotations (``from __future__ import annotations``) so Typer
+    # sees the real ``Annotated[..., typer.Option(...)]`` metadata on the wrapper.
+    hints = typing.get_type_hints(func, include_extras=True)
+    kept = [
+        p.replace(annotation=hints.get(p.name, p.annotation))
+        for p in original.parameters.values()
+        if p.name != COMMON_PARAMETER_NAME
+    ]
     if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in kept):
         raise TypeError(f"{func.__qualname__} must not take **kwargs")
     injected = [
@@ -162,7 +170,13 @@ def common_options(func: Callable[..., Any]) -> Callable[..., Any]:
         kwargs[COMMON_PARAMETER_NAME] = common
         return func(*args, **kwargs)
 
-    wrapper.__signature__ = original.replace(parameters=[*kept, *injected])  # type: ignore[attr-defined]
+    params = [*kept, *injected]
+    wrapper.__signature__ = original.replace(  # type: ignore[attr-defined]
+        parameters=params, return_annotation=hints.get("return", original.return_annotation)
+    )
+    wrapper.__annotations__ = {p.name: p.annotation for p in params}
+    if "return" in hints:
+        wrapper.__annotations__["return"] = hints["return"]
     return wrapper
 
 
@@ -177,6 +191,7 @@ app = typer.Typer(
     help="proof-ci: an agent-native CI layer. Fast, structured, local-first checks.",
     no_args_is_help=True,
     rich_markup_mode=None,
+    pretty_exceptions_enable=False,
 )
 
 
@@ -256,3 +271,60 @@ def init(
         typer.echo("Created a signing key")
     else:
         typer.echo(f"No signing key created: {result.key_skipped_reason}")
+
+
+@app.command()
+@common_options
+def run(
+    tests: Annotated[
+        list[str] | None,
+        typer.Argument(metavar="TESTS", help="pytest node ids or file paths (explicit mode)."),
+    ] = None,
+    all_tests: Annotated[bool, typer.Option("--all", help="Run every collected test.")] = False,
+    failed: Annotated[
+        bool, typer.Option("--failed", help="Re-run the previous run's failed and errored tests.")
+    ] = False,
+    *,
+    common: CommonOptions,
+) -> None:
+    """Run tests through pytest and write a structured RunSummary."""
+    from proof_ci.runner import RunError, RunOptions, execute_run
+
+    explicit = tuple(tests or ())
+    chosen = sum(bool(x) for x in (explicit, all_tests, failed))
+    if chosen > 1:
+        raise _fail("--all, --failed, and TESTS are mutually exclusive", EXIT_USAGE)
+    if chosen == 0:
+        raise _fail(
+            "affected-test selection arrives in milestone M5; use --all, --failed, or TESTS for now",
+            EXIT_USAGE,
+        )
+    mode: Literal["all", "explicit", "failed"] = (
+        "explicit" if explicit else "all" if all_tests else "failed"
+    )
+    try:
+        cfg = load_config(common.repo, common.config)
+        outcome = execute_run(
+            cfg, RunOptions(mode=mode, tests=explicit, json_output=common.json_output)
+        )
+    except ConfigError as exc:
+        raise _fail(str(exc), EXIT_USAGE) from exc
+    except RunError as exc:
+        raise _fail(str(exc), EXIT_RUNTIME) from exc
+
+    summary = outcome.summary
+    if common.json_output:
+        emit_json(summary.to_json())
+    else:
+        sel = summary.selection
+        typer.echo(f"proof-ci run ({sel.mode}): {summary.summary}")
+        typer.echo(f"Checked {sel.selected_count}/{sel.collected_count} tests.")
+        for f in summary.failures:
+            where = f"{f.file}:{f.line}" if f.line else f.file
+            typer.echo(f"FAILED {f.test_id} ({where})")
+            typer.echo(
+                f"  {f.error_type}: {f.error_message.splitlines()[0] if f.error_message else ''}"
+            )
+            typer.echo(f"  repro: {f.repro_command}")
+        typer.echo(f"Results: {summary.results_path}")
+    raise typer.Exit(outcome.exit_code)

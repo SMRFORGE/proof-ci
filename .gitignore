@@ -35,3 +35,6 @@ Thumbs.db
 .proof-ci/last-run.json
 .proof-ci/runs/
 .proof-ci/logs/
+
+# proof-ci state inside example projects
+**/.proof-ci/
