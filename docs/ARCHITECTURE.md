@@ -37,7 +37,7 @@ flowchart TB
 | `cli.py` | Typer commands; `--json`, `--repo`, `--config` on every leaf command; exit codes 0-4 |
 | `config.py` | `proof-ci.toml` loading, defaults, repo-root discovery, `init` |
 | `runner.py` | One run: selection plan, cache lookup, pytest, flakes, savings, artifacts |
-| `affected.py` | Base resolution, changed files, fallback globs and untraced changes (incremental, green-full-run anchored), whole-repo import graph, likely cause |
+| `affected.py` | Base resolution, changed files, fallback globs and untraced changes and their launchers (incremental, anchored on the last full fresh run), whole-repo import graph, likely cause |
 | `cache.py` | Collection cache and result cache (RFC 8785 + SHA-256 keys), LRU trim |
 | `flakes.py` | Outcome history, flake detection and transitions, manual marks |
 | `savings.py` | Calibration, per-run Savings object, ledger, reports |

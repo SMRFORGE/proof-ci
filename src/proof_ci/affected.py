@@ -24,6 +24,7 @@ __all__ = [
     "Hunk",
     "ImportGraph",
     "Selection",
+    "Untraced",
     "changed_files",
     "changed_hunks",
     "decide_fallback",
@@ -34,6 +35,7 @@ __all__ = [
     "references_data_file",
     "resolve_base",
     "select",
+    "since_tree",
     "untraced_changes",
 ]
 
@@ -181,8 +183,9 @@ def decide_fallback(
 
     ``extra_triggers`` are ``(path, why)`` pairs for changes selection cannot trace
     (see :func:`untraced_changes`); they fire the full run exactly like a glob match.
-    ``tree_last`` must be the tree of the last *green full* run on the branch: the
-    fallback is suppressed only when none of the triggering files changed since then.
+    ``tree_last`` must be the tree of the last full fresh run on the branch
+    (:meth:`SavingsLedger.last_full`): the fallback is suppressed only when none of the
+    triggering files changed since then, and the caller reruns that run's failures.
     """
     matches = [
         (path, f"{path} matched fallback glob '{g}'")
@@ -210,6 +213,12 @@ def decide_fallback(
     elif tree_now and tree_last and tree_now == tree_last:
         return FallbackDecision(False, f"suppressed: {described}", suppressed_by_tree=tree_last)
     return FallbackDecision(True, f"full run because {described}")
+
+
+def since_tree(repo: Path, tree_from: str, tree_to: str) -> set[str]:
+    """Paths that differ between two tree objects (empty if git cannot diff them)."""
+    proc = run_git(repo, "diff-tree", "-r", "--name-only", "-z", tree_from, tree_to, check=False)
+    return {p for p in proc.stdout.split("\0") if p} if proc.returncode == 0 else set()
 
 
 # --------------------------------------------------------- Step 4: import graph
@@ -541,40 +550,142 @@ def loaded_conftests(graph: ImportGraph, test_files: Iterable[str]) -> set[str]:
     return out
 
 
+# Files whose text can register a module as a pytest plugin or name it on the command line.
+_CONFIG_FILES = ("pyproject.toml", "setup.cfg", "pytest.ini", "tox.ini", "proof-ci.toml")
+# Directory names too generic to count as naming the files below them.
+_GENERIC_DIRS = frozenset({"src", "lib", "test", "tests", "testing"})
+
+
+@dataclass(frozen=True)
+class Untraced:
+    """What :func:`untraced_changes` found.
+
+    ``triggers`` force the full run. ``extra_test_files`` are test files that launch
+    code the import graph cannot follow (a subprocess, a file path, a dynamic loader);
+    they are selected in addition to the import-graph selection and never read the cache.
+    """
+
+    triggers: list[tuple[str, str]]
+    extra_test_files: frozenset[str] = frozenset()
+
+
+def _name_patterns(graph: ImportGraph, path: str) -> list[re.Pattern[str]]:
+    """Ways a file that launches ``path`` would have to spell it."""
+    p = PurePosixPath(path)
+    pats = [re.escape(path)]
+    for dotted in graph._module_names(path):
+        if p.name == "__main__.py":
+            pkg = dotted.removesuffix(".__main__")
+            if pkg and pkg != "__main__":
+                esc = re.escape(pkg)
+                pats.append(rf"""-m["',\s]+{esc}\b""")
+                pats.append(rf"""run_module\(\s*["']{esc}\b""")
+        elif "." in dotted:
+            pats.append(re.escape(dotted))
+    if p.stem not in ("__init__", "__main__"):
+        pats.append(rf"\b{re.escape(p.stem)}\b")
+    # Code below a plain directory (no __init__.py) is often loaded by directory: a tools/
+    # folder scanned by path, an example project copied into a tmp dir.
+    parent = p.parent
+    roots = set(graph.roots)
+    while parent.as_posix() not in ("", "."):
+        d = parent.as_posix()
+        if d in roots or (graph.repo / d / "__init__.py").is_file():
+            break
+        if parent.name not in _GENERIC_DIRS:
+            esc = re.escape(parent.name)
+            pats.append(rf"""["'/\\]{esc}["'/\\]""")
+        parent = parent.parent
+    return [re.compile(x) for x in pats]
+
+
+def _plugin_like(graph: ImportGraph, path: str, config_text: str) -> bool:
+    names = [n for n in graph._module_names(path) if "." in n or n == PurePosixPath(path).stem]
+    return any(re.search(rf"(?<![\w.]){re.escape(n)}(?![\w])", config_text) for n in names)
+
+
+def _tests_reaching(graph: ImportGraph, files: Iterable[str], tests: set[str]) -> set[str]:
+    out: set[str] = set()
+    for f in graph._dependents(files):
+        if f in tests:
+            out.add(f)
+        elif PurePosixPath(f).name == "conftest.py":
+            parent = PurePosixPath(f).parent.as_posix()
+            out |= (
+                tests if parent in ("", ".") else {t for t in tests if t.startswith(parent + "/")}
+            )
+    return out
+
+
 def untraced_changes(
     graph: ImportGraph,
     changed: list[str],
     test_files: Iterable[str],
     source_roots: Iterable[str],
-) -> list[tuple[str, str]]:
-    """Changed files whose effect on tests the import graph cannot see (``(path, why)``).
+) -> Untraced:
+    """Changed files whose effect on tests the import graph cannot see.
 
-    proof-ci's rule is to run the full suite when unsure. A changed Python file is
-    untraced when it, or anything that imports it, is not reachable by import from a
-    collected test file or a conftest pytest loads for one: such code reaches tests
-    another way (a pytest plugin entry point or ``-p``, a subprocess, a file path, a
-    ``__main__``). A changed non-Python file is untraced when it lives under a source
-    root (package data) or when a non-test Python file names it (data read by code).
-    Data files only a test file names are traced (Step 6 selects those tests).
+    proof-ci's rule is to run the full suite when unsure. An *orphan* is a Python file
+    no collected test file (or conftest pytest loads for one) reaches by import. Code
+    reaches tests through an orphan only if something runs the orphan, so for a changed
+    Python file every orphan that is, or imports, it is checked:
+
+    - registered as a plugin or named in pytest config (``pyproject.toml`` and friends):
+      full run;
+    - named by a file tests do reach (a subprocess command, a path, a ``-m`` module, a
+      directory a loader scans), or loadable by a dynamic loader in its package: the
+      tests reaching that launcher are added to the selection, uncached;
+    - named by nothing tests reach: if the orphan *is* the changed file, full run (it may
+      load in a way proof-ci cannot see); otherwise it is ignored, since tests cannot run
+      it (benchmarks, release scripts, examples nobody launches) and the changed file's
+      own importers are selected as usual.
+
+    A changed non-Python file is a full-run trigger when it lives under a source root
+    (package data) or when a non-test Python file names it (data read by code). Data
+    files only a test file names are traced (Step 6 selects those tests).
     """
     tests = set(test_files)
     roots = tests | loaded_conftests(graph, tests)
     reached = graph.reached_from(roots)
     orphans = {f for f in graph.files if f not in reached}
     src = [r.strip("/") for r in source_roots if r.strip("/")]
+    config_text = "\n".join(
+        (graph.repo / name).read_text(encoding="utf-8", errors="replace")
+        for name in _CONFIG_FILES
+        if (graph.repo / name).is_file()
+    )
     triggers: list[tuple[str, str]] = []
+    extra: set[str] = set()
     for path in changed:
         if path.endswith(".py"):
             if path in tests:
                 continue
-            bad = graph._dependents([path]) & orphans
-            if not bad:
-                continue
-            if path in bad:
-                why = f"{path} is not imported by any collected test (it may load as a plugin, subprocess or by path)"
-            else:
-                why = f"{path} is imported by {min(bad)}, which no collected test imports"
-            triggers.append((path, why))
+            reason: str | None = None
+            for orphan in sorted(graph._dependents([path]) & orphans):
+                via = "" if orphan == path else f" (imported by {orphan})"
+                if _plugin_like(graph, orphan, config_text):
+                    reason = (
+                        f"{path}{via} is named in pytest/project config (it may load as a plugin)"
+                    )
+                    break
+                pats = _name_patterns(graph, orphan)
+                launchers = {
+                    f
+                    for f in reached
+                    if f != orphan and any(pt.search(graph.texts.get(f, "")) for pt in pats)
+                }
+                top = graph._top_package(orphan)
+                launchers |= {d for d in graph.dynamic & reached if graph._top_package(d) == top}
+                if launchers:
+                    extra |= _tests_reaching(graph, launchers, tests)
+                elif orphan == path:
+                    reason = (
+                        f"{path} is not imported by any collected test and nothing tests "
+                        "reach names it (it may load as a plugin, subprocess or by path)"
+                    )
+                    break
+            if reason:
+                triggers.append((path, reason))
             continue
         if any(path == r or path.startswith(r + "/") for r in src):
             triggers.append((path, f"{path} is package data under a source root"))
@@ -586,7 +697,7 @@ def untraced_changes(
         )
         if readers:
             triggers.append((path, f"{path} is named by non-test code {readers[0]}"))
-    return triggers
+    return Untraced(triggers, frozenset(extra))
 
 
 @dataclass(frozen=True)

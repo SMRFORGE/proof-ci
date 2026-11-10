@@ -230,12 +230,11 @@ class SavingsLedger:
                 # Which selection mode produced the row: only affected/all runs honour the
                 # full-run fallback, so only they may suppress it later (Section 5.8 Step 3).
                 conn.execute("ALTER TABLE savings_ledger ADD COLUMN mode TEXT")
-            if "full_green" not in columns:
-                # 1 when the run executed every collected test fresh and all passed: only
-                # such a run may later suppress the full-run fallback (M13 C4).
-                conn.execute(
-                    "ALTER TABLE savings_ledger ADD COLUMN full_green INTEGER NOT NULL DEFAULT 0"
-                )
+            if "full_failed" not in columns:
+                # Set only on a run that executed every collected test fresh to completion:
+                # the JSON list of test ids that failed or errored in it ("[]" when green).
+                # Such a run anchors the full-run fallback; see last_full (M13 C4).
+                conn.execute("ALTER TABLE savings_ledger ADD COLUMN full_failed TEXT")
             yield conn
             conn.commit()
         finally:
@@ -270,20 +269,32 @@ class SavingsLedger:
             ).fetchone()
         return int(r[0]) if r else 0
 
-    def last_tree(self, branch: str) -> str | None:
-        """Tree of the last run on ``branch`` that executed every collected test fresh and
-        passed. The full-run fallback is suppressed only relative to such a run, so a
-        failing full run never makes the next run quietly select less (M13 C4)."""
+    def last_full(self, branch: str) -> tuple[str, list[str]] | None:
+        """Tree and failing test ids of the last run on ``branch`` that executed every
+        collected test fresh to completion, green or not.
+
+        The full-run fallback is suppressed only relative to such a run. A red one still
+        anchors, but the caller must rerun its failures, so a failing full run never lets
+        the next run quietly report less (M13 C4) and a fix loop is not a full run per try.
+        """
         if not self.path.exists():
             return None
         with self._connect() as conn:
             r = conn.execute(
-                "SELECT commit_tree FROM savings_ledger WHERE branch = ? AND commit_tree IS NOT NULL "
-                "AND mode IN ('affected', 'all') AND full_green = 1 "
-                "ORDER BY recorded_at DESC, id DESC LIMIT 1",
+                "SELECT commit_tree, full_failed FROM savings_ledger WHERE branch = ? "
+                "AND commit_tree IS NOT NULL AND mode IN ('affected', 'all') "
+                "AND full_failed IS NOT NULL ORDER BY recorded_at DESC, id DESC LIMIT 1",
                 (branch,),
             ).fetchone()
-        return str(r[0]) if r else None
+        if not r:
+            return None
+        try:
+            failed = json.loads(r[1])
+        except ValueError:
+            return None
+        if not isinstance(failed, list):
+            return None
+        return str(r[0]), [str(x) for x in failed]
 
     def dedupe_seen(self, key: str) -> bool:
         if not self.path.exists():
@@ -738,7 +749,7 @@ def ledger_row(
     collected_count: int,
     duration_ms: int,
     mode: str | None = None,
-    full_green: bool = False,
+    full_failed: list[str] | None = None,
 ) -> dict[str, Any]:
     t = savings.totals
     return {
@@ -767,7 +778,7 @@ def ledger_row(
         "savings_json": json.dumps(savings.to_json(), ensure_ascii=False),
         "record_path": None,
         "mode": mode,
-        "full_green": int(full_green),
+        "full_failed": None if full_failed is None else json.dumps(sorted(full_failed)),
     }
 
 

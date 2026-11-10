@@ -108,20 +108,26 @@ flowchart TB
 ```
 
 - **When unsure, it runs the full suite.** A change to `pyproject.toml`, the root `conftest.py`, a
-  lockfile, or CI config runs everything. So does any change the import graph cannot trace to a test:
-  a Python file no collected test reaches by import (a pytest plugin loaded by entry point or `-p`,
-  a script a test launches as a subprocess, a module loaded by file path, or anything such a file
-  imports), package data under a source root, and a data file named by non-test code. These full
-  runs never replay the cache. After a full run that passes, later runs on the branch go back to
-  normal selection until one of those files changes again; a failing full run keeps the full run on.
+  lockfile, or CI config runs everything. So does a change the import graph cannot trace to a test:
+  a Python file no collected test imports and nothing tests reach names (it may load as a plugin,
+  by path, or in a subprocess), a module registered in pytest or project config, package data under
+  a source root, and a data file named by non-test code. These full runs never replay the cache.
+- **Code that tests launch is followed.** When a test runs a script as a subprocess, runs
+  `python -m pkg`, or loads a directory by path, editing that script, or a module it imports, adds
+  the tests that launch it (uncached) to the normal selection. A script nothing launches, such as a
+  benchmark, does not widen the selection.
+- **Full runs anchor later runs, green or red.** After a full run, later runs on the branch select
+  normally until a full-run trigger changes again. Files that differ from the anchor run are
+  selected even if they now match the base, and the anchor's failures always rerun, so a fix loop
+  does not repeat the full suite and a red run never turns green by running less.
+- **A test file that fails to import** selects only itself and is reported as an `error` result.
 - **The base defaults to `auto`:** the merge-base with your default branch, so a committed change
   on a clean tree still selects the tests it affects. A run that selects nothing says why, and is
   never signed.
 - **Data files** (including docs such as `README.md`) select the tests whose file mentions their
   name or path. A data file nothing names selects nothing. Dynamic imports
   (`importlib.import_module`) are handled conservatively, not completely.
-- **`run --all` executes every test fresh,** never from the cache. A test file that fails to collect
-  is reported as an `error` result for that file, not a crash.
+- **`run --all` executes every test fresh,** never from the cache.
 - **The cache** stores only passing, skipped, and xfail results, keyed by the test file, its import
   closure, the `conftest.py` chain, the pytest config, referenced data files, the interpreter, and
   the installed packages. Failures always re-run.

@@ -416,6 +416,10 @@ def test_likely_cause_end_to_end(demo: Path) -> None:
     assert cause["line"] == 5
 
 
+def _results(repo: Path, summary: dict) -> list[dict]:
+    return json.loads((repo / summary["results_path"]).read_text(encoding="utf-8"))
+
+
 def _fix_failing_demo_test(repo: Path) -> None:
     path = repo / "tests/test_math.py"
     text = path.read_text(encoding="utf-8")
@@ -425,16 +429,39 @@ def _fix_failing_demo_test(repo: Path) -> None:
     git(repo, "commit", "-q", "-am", "green")
 
 
-def test_failing_full_run_never_suppresses_the_fallback(demo: Path) -> None:
+def test_failing_full_run_anchors_but_its_failures_always_rerun(demo: Path) -> None:
     git(demo, "checkout", "-q", "-b", "feat")
     with (demo / "pyproject.toml").open("a", encoding="utf-8") as fh:
         fh.write("\n# bump\n")
     git(demo, "commit", "-q", "-am", "bump")
     _, first, _ = run_json("run", "--json", "--repo", str(demo))
     assert first["selection"]["fallback_full_run"] is True and first["outcome"] == "failed"
-    edit_mathops(demo)
+    failing = "tests/test_math.py::test_div_wrong_expectation"
+    # A textops edit does not select test_math.py by itself; the anchor's failure still
+    # reruns, so the run stays red instead of quietly reporting less (M13 C4).
+    text = demo / "src/demo/textops.py"
+    text.write_text(text.read_text(encoding="utf-8") + "\n# touch\n", encoding="utf-8")
     _, second, _ = run_json("run", "--json", "--repo", str(demo))
-    assert second["selection"]["fallback_full_run"] is True
+    assert second["selection"]["fallback_full_run"] is False
+    assert second["selection"]["fallback_suppressed_by_tree"]
+    ids = {r["test_id"]: r for r in _results(demo, second)}
+    assert ids[failing]["outcome"] == "failed"
+    assert ids[failing]["cache_hit"] is False
+    assert second["outcome"] == "failed"
+    assert second["selection"]["selected_count"] < first["selection"]["selected_count"]
+
+
+def test_file_reverted_after_the_anchor_is_still_selected(demo: Path) -> None:
+    _fix_failing_demo_test(demo)
+    git(demo, "checkout", "-q", "-b", "feat")
+    edit_mathops(demo)
+    git(demo, "commit", "-q", "-am", "edit")
+    run_json("run", "--all", "--json", "--repo", str(demo))  # anchor: edited mathops
+    # mathops now matches main again, so a diff against main misses it; the anchor ran
+    # the other version, so its tests must run again.
+    git(demo, "checkout", "-q", "main", "--", "src/demo/mathops.py")
+    _, run, _ = run_json("run", "--json", "--repo", str(demo))
+    assert any(r["test_id"].startswith("tests/test_math.py::") for r in _results(demo, run))
 
 
 def test_run_records_suppressed_fallback(demo: Path) -> None:
@@ -595,13 +622,91 @@ def test_module_no_test_imports_forces_a_full_run(demo: Path) -> None:
     assert len(data["selected_tests"]) == 7
 
 
-def test_module_reached_through_an_untested_script_forces_a_full_run(demo: Path) -> None:
-    # tools/serve.py is launched as a subprocess by a test; it imports demo.textops.
-    _commit_files(demo, {"tools/serve.py": "from demo import textops\nprint(textops)\n"})
+TEXT = {
+    "tests/test_text.py::test_shout",
+    "tests/test_text.py::test_words",
+}
+
+LAUNCHER = (
+    "import subprocess, sys\n\n\n"
+    "def test_serve():\n"
+    "    subprocess.run([sys.executable, 'tools/serve.py'], check=True)\n"
+)
+
+
+def test_module_reached_through_a_launched_script_selects_the_launcher(demo: Path) -> None:
+    # tools/serve.py imports demo.textops and a test runs it as a subprocess, so a
+    # textops edit selects that test (uncached) on top of textops's importers.
+    _commit_files(
+        demo,
+        {
+            "tools/serve.py": "from demo import textops\nprint(textops)\n",
+            "tests/test_serve.py": LAUNCHER,
+        },
+    )
     _append(demo, "src/demo/textops.py", "\n# edit\n")
     data = _affected(demo)
+    assert data["fallback_full_run"] is False
+    assert set(data["selected_tests"]) == TEXT | {"tests/test_serve.py::test_serve"}
+
+
+def test_module_reached_only_through_an_unlaunched_script_selects_narrowly(demo: Path) -> None:
+    # Nothing tests reach names tools/bench.py, so tests cannot run it: a benchmark or
+    # release script importing the package does not widen the selection.
+    _commit_files(demo, {"tools/bench.py": "from demo import textops\nprint(textops)\n"})
+    _append(demo, "src/demo/textops.py", "\n# edit\n")
+    data = _affected(demo)
+    assert data["fallback_full_run"] is False
+    assert set(data["selected_tests"]) == TEXT
+
+
+def test_edited_launched_script_selects_its_launcher_only(demo: Path) -> None:
+    _commit_files(
+        demo,
+        {"tools/serve.py": "print('serve')\n", "tests/test_serve.py": LAUNCHER},
+    )
+    _append(demo, "tools/serve.py", "\n# edit\n")
+    data = _affected(demo)
+    assert data["fallback_full_run"] is False
+    assert data["selected_tests"] == ["tests/test_serve.py::test_serve"]
+
+
+def test_module_named_in_pytest_config_forces_a_full_run(demo: Path) -> None:
+    _commit_files(demo, {"src/demo/plug.py": "def pytest_configure(config):\n    pass\n"})
+    _append(demo, "pyproject.toml", '\n[project.entry-points.pytest11]\ndemo = "demo.plug"\n')
+    git(demo, "commit", "-q", "-am", "register plugin")
+    _append(demo, "src/demo/plug.py", "\n# edit\n")
+    data = _affected(demo)
     assert data["fallback_full_run"] is True
-    assert "tools/serve.py" in data["fallback_reason"]
+    assert "named in pytest/project config" in data["fallback_reason"]
+
+
+def test_main_module_run_with_dash_m_selects_its_launcher(demo: Path) -> None:
+    _commit_files(
+        demo,
+        {
+            "src/demo/__main__.py": "from demo import textops\nprint(textops)\n",
+            "tests/test_cli.py": (
+                "import subprocess, sys\n\n\ndef test_cli():\n"
+                "    subprocess.run([sys.executable, '-m', 'demo'], check=True)\n"
+            ),
+        },
+    )
+    _append(demo, "src/demo/textops.py", "\n# edit\n")
+    data = _affected(demo)
+    assert data["fallback_full_run"] is False
+    assert set(data["selected_tests"]) == TEXT | {"tests/test_cli.py::test_cli"}
+
+
+def test_broken_test_file_selects_only_itself(demo: Path) -> None:
+    _fix_failing_demo_test(demo)
+    run_json("run", "--all", "--json", "--repo", str(demo))
+    _append(demo, "tests/test_text.py", "\nimport no_such_module_m13\n")
+    code, summary, _ = run_json("run", "--json", "--repo", str(demo))
+    assert code == 1
+    assert summary["selection"]["fallback_full_run"] is False
+    ids = [r["test_id"] for r in _results(demo, summary)]
+    assert ids == ["tests/test_text.py"]
 
 
 def test_traced_module_edit_still_selects_narrowly(demo: Path) -> None:

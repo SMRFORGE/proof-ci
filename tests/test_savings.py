@@ -470,12 +470,14 @@ def test_tampered_payload_savings_fails_verify(
     assert r.exit_code == 4
 
 
-def test_ledger_holds_last_tree_for_honouring_runs_only(demo: Path) -> None:
+def test_ledger_anchors_on_full_fresh_runs_with_their_failures(demo: Path) -> None:
     ledger = SavingsLedger(demo / ".proof-ci" / "savings.sqlite")
     cli.invoke(app, ["run", "tests/test_text.py", "--repo", str(demo)])  # explicit
-    assert ledger.last_tree("main") is None
+    assert ledger.last_full("main") is None
     cli.invoke(app, ["run", "--all", "--repo", str(demo)])  # full, but one test fails
-    assert ledger.last_tree("main") is None  # a failing full run never suppresses (M13 C4)
+    red = ledger.last_full("main")
+    assert red is not None
+    assert red[1] == ["tests/test_math.py::test_div_wrong_expectation"]
     math = demo / "tests/test_math.py"
     math.write_text(
         math.read_text(encoding="utf-8").replace(
@@ -484,4 +486,7 @@ def test_ledger_holds_last_tree_for_honouring_runs_only(demo: Path) -> None:
         encoding="utf-8",
     )
     cli.invoke(app, ["run", "--all", "--repo", str(demo)])  # full and green
-    assert ledger.last_tree("main") is not None
+    green = ledger.last_full("main")
+    assert green is not None
+    assert green[1] == []
+    assert green[0] != red[0]

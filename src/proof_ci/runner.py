@@ -36,6 +36,7 @@ from proof_ci.affected import (
     references_data_file,
     resolve_base,
     select,
+    since_tree,
     untraced_changes,
 )
 from proof_ci.cache import (
@@ -410,28 +411,50 @@ def plan_selection(
     graph: ImportGraph | None = None
     no_cache_files: set[str] = set()
     if options.mode == "affected":
-        tree_last = None
-        if branch:
-            tree_last = SavingsLedger(cfg.resolve(cfg.savings.db)).last_tree(branch)
+        anchor = SavingsLedger(cfg.resolve(cfg.savings.db)).last_full(branch) if branch else None
+        tree_last = anchor[0] if anchor else None
+        # Files that differ from the anchor run's tree are selected too, even when they now
+        # match the base again: the anchor ran them in their other state.
+        considered = list(changed)
+        if tree_last and info.tree and tree_last != info.tree:
+            considered += sorted(since_tree(cfg.repo_root, tree_last, info.tree) - set(changed))
         graph = ImportGraph.build(
-            cfg.repo_root, cfg.project.source_roots, cfg.project.test_paths, changed
+            cfg.repo_root, cfg.project.source_roots, cfg.project.test_paths, considered
         )
-        untraced = untraced_changes(
-            graph, changed, set(item_file.values()), cfg.project.source_roots
-        )
+        # A test file that failed to collect is still a test file: its own edit selects it
+        # (as a collection error), not the whole suite (M13 recheck).
+        test_files = set(item_file.values()) | {
+            case.canonical(str(e.get("nodeid") or "").partition("::")[0])
+            for e in collect_errors
+            if str(e.get("nodeid") or "").partition("::")[0].endswith(".py")
+        }
+        untraced = untraced_changes(graph, considered, test_files, cfg.project.source_roots)
         fallback = decide_fallback(
             cfg.repo_root,
-            changed,
+            considered,
             cfg.affected.fallback_full_run_globs,
             tree_now=info.tree,
             tree_last=tree_last,
-            extra_triggers=untraced,
+            extra_triggers=untraced.triggers,
         )
-        chosen = select(
-            cfg.repo_root, changed, [(t, item_file[t]) for t in collected_ids], graph, fallback
-        )
+        pairs = [(t, item_file[t]) for t in collected_ids]
+        chosen = select(cfg.repo_root, considered, pairs, graph, fallback)
         selected = chosen.selected
         no_cache_files = set(chosen.no_cache_files)
+        if not fallback.fired:
+            # Tests that launch untraced code, and the anchor run's failures: rerun fresh.
+            failed_before = set(anchor[1]) if anchor and fallback.suppressed_by_tree else set()
+            extra_files = set(untraced.extra_test_files)
+            extra_files |= {f for f in failed_before if f in test_files}
+            have = set(selected)
+            add = {
+                t for t, f in pairs if t not in have and (f in extra_files or t in failed_before)
+            }
+            if add:
+                selected = [t for t in collected_ids if t in have or t in add]
+            no_cache_files |= extra_files | {
+                item_file[t] for t in collected_ids if t in failed_before
+            }
         for path in chosen.unmatched_data_files:
             debug(f"changed non-Python file {path} is not referenced by any test file")
     elif options.mode == "failed":
@@ -679,13 +702,14 @@ def _savings(
             collected_count=len(plan.collected_ids),
             duration_ms=summary.duration_ms,
             mode=plan.mode,
-            full_green=(
-                plan.mode in ("affected", "all")
+            full_failed=(
+                [r.test_id for r in results if r.outcome in ("failed", "error")]
+                if plan.mode in ("affected", "all")
                 and bool(plan.selected)
                 and len(plan.selected) == len(plan.collected_ids)
                 and not hits
-                and summary.counts.failed + summary.counts.error == 0
-                and summary.outcome == "passed"
+                and summary.outcome in ("passed", "failed")
+                else None
             ),
         )
     )
