@@ -91,6 +91,7 @@ class RunOutcome:
     exit_code: int
     pytest_stdout: str
     notes: list[str] = field(default_factory=list)
+    run_dir: Path | None = None
 
 
 def _validate_test_args(cfg: Config, tests: tuple[str, ...]) -> None:
@@ -679,6 +680,8 @@ def execute_run(cfg: Config, options: RunOptions) -> RunOutcome:
     )
     _write_json(results_path, [r.to_json() for r in results])
     _write_json(run_dir / "summary.json", summary.to_json())
+    # The interpreter that ran pytest, for RunRecord.payload.environment (M8).
+    _write_json(run_dir / "environment.json", {"python": env.python, "platform": env.platform})
     _write_json(cfg.repo_root / STATE_DIR / "last-run.json", summary.to_json())
     if plan.branch and info.tree:
         # TODO(M9): the savings ledger replaces this stub (spec milestone M5).
@@ -691,4 +694,5 @@ def execute_run(cfg: Config, options: RunOptions) -> RunOutcome:
         exit_code=exit_code,
         pytest_stdout=pytest_stdout,
         notes=plan.notes,
+        run_dir=run_dir,
     )

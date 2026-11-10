@@ -242,8 +242,14 @@ def test_init_writes_files(repo: Path, key_dir: Path) -> None:
     gi = (repo / ".gitignore").read_text(encoding="utf-8")
     for entry in GITIGNORE_ENTRIES:
         assert entry in gi.splitlines()
-    assert result.key_created is False
-    assert "M8" in (result.key_skipped_reason or "")
+    assert result.key_created is True
+    assert result.key_skipped_reason is None
+    assert (key_dir / "ed25519.pem").is_file()
+    assert (key_dir / "ed25519.pem.pub").is_file()
+    # A second (forced) init keeps the existing key.
+    again = init_repo(repo, force=True)
+    assert again.key_created is False
+    assert "already exists" in (again.key_skipped_reason or "")
 
 
 def test_init_appends_to_existing_gitignore(repo: Path, key_dir: Path) -> None:
@@ -332,7 +338,7 @@ def test_cli_init_json(repo: Path, key_dir: Path, monkeypatch: pytest.MonkeyPatc
         "key_skipped_reason",
         "discovered_command",
     }
-    assert data["key_created"] is False
+    assert data["key_created"] is True
     assert data["discovered_command"] is None
     assert "\\" not in data["repo"]
 

@@ -37,6 +37,7 @@ __all__ = [
 
 EXIT_USAGE = 2
 EXIT_RUNTIME = 3
+EXIT_VERIFY = 4
 
 
 def configure_utf8_streams() -> None:
@@ -299,6 +300,13 @@ def run(
             help="Do not fail on confirmed or ignored flaky tests (unchanged code only).",
         ),
     ] = False,
+    agent_id: Annotated[
+        str | None, typer.Option("--agent-id", metavar="ID", help="Agent id for a signed record.")
+    ] = None,
+    record_out: Annotated[
+        Path | None,
+        typer.Option("--record-out", metavar="PATH", help="Where to write the signed record."),
+    ] = None,
     *,
     common: CommonOptions,
 ) -> None:
@@ -332,14 +340,18 @@ def run(
     for note in outcome.notes:
         typer.echo(note, err=True)
     summary = outcome.summary
-    sign_refused: str | None = None
+    sign_refused: tuple[str, int] | None = None
     if sign:
         # A green record must mean at least one test was checked (Section 5.8 Step 7).
         if summary.selection.selected_count == 0:
-            sign_refused = "cannot sign a run that selected no tests"
-        else:
-            # TODO(M8): build, sign, and write the RunRecord here.
-            sign_refused = "signing arrives in milestone M8; the run was not signed"
+            sign_refused = ("cannot sign a run that selected no tests", EXIT_USAGE)
+        elif outcome.run_dir is not None:
+            try:
+                out = _record_output(cfg, outcome.run_dir, record_out)
+                signed = _sign(cfg, outcome.run_dir, agent_id, None, out, recheck_tree=False)
+                summary = _attach_record(cfg, outcome.run_dir, summary, signed)
+            except _SignFailure as exc:
+                sign_refused = (exc.message, exc.code)
 
     if common.json_output:
         emit_json(summary.to_json())
@@ -357,8 +369,10 @@ def run(
             typer.echo(f"  {f.error_type}: {first}")
             typer.echo(f"  repro: {f.repro_command}")
         typer.echo(f"Results: {summary.results_path}")
+        if summary.record_path:
+            typer.echo(f"Signed record: {summary.record_path}")
     if sign_refused is not None:
-        raise _fail(sign_refused, EXIT_USAGE)
+        raise _fail(*sign_refused)
     raise typer.Exit(outcome.exit_code)
 
 
@@ -529,3 +543,232 @@ def flakes_unmark(
         emit_json(record.to_json())
     else:
         _print_flake(record)
+
+
+# ----------------------------------------------------------------- records
+
+
+class _SignFailure(Exception):
+    def __init__(self, message: str, code: int) -> None:
+        super().__init__(message)
+        self.message = message
+        self.code = code
+
+
+def _record_output(cfg: Any, run_dir: Path, requested: Path | None) -> Path:
+    """Default ``<run_dir>/record.json``; an explicit path must stay inside the repo."""
+    if requested is None:
+        return run_dir / "record.json"
+    target = requested if requested.is_absolute() else Path.cwd() / requested
+    target = target.resolve()
+    try:
+        target.relative_to(cfg.repo_root.resolve())
+    except ValueError as exc:
+        raise _SignFailure(f"{requested} resolves outside the repository", EXIT_USAGE) from exc
+    return target
+
+
+def _sign(
+    cfg: Any,
+    run_dir: Path,
+    agent_id: str | None,
+    key: Path | None,
+    output: Path,
+    *,
+    recheck_tree: bool,
+) -> Any:
+    import os
+
+    from proof_ci.adapters.agent.identity import resolve_identity
+    from proof_ci.record import KeyError_, SignError, resolve_key_path, sign_run
+
+    identity = resolve_identity(agent_id, cfg.record.agent_id, os.environ)
+    if identity.defaulted:
+        _warn("no agent id given; using 'local' (set --agent-id or PROOF_CI_AGENT_ID)")
+    try:
+        result = sign_run(
+            cfg,
+            run_dir,
+            identity,
+            resolve_key_path(cfg, key),
+            output,
+            recheck_tree=recheck_tree,
+        )
+    except SignError as exc:
+        raise _SignFailure(str(exc), EXIT_RUNTIME if exc.runtime else EXIT_USAGE) from exc
+    except KeyError_ as exc:
+        raise _SignFailure(str(exc), EXIT_USAGE) from exc
+    for message in result.warnings:
+        _warn(message)
+    return result
+
+
+def _attach_record(cfg: Any, run_dir: Path, summary: Any, signed: Any) -> Any:
+    from proof_ci.runner import _rel, _write_json
+
+    try:
+        record_path = _rel(cfg, signed.path)
+    except ValueError:
+        record_path = signed.path.as_posix()
+    updated = summary.model_copy(update={"record_path": record_path})
+    _write_json(run_dir / "summary.json", updated.to_json())
+    last = cfg.repo_root / ".proof-ci" / "last-run.json"
+    if last.is_file():
+        try:
+            if json.loads(last.read_text(encoding="utf-8")).get("run_id") == str(summary.run_id):
+                _write_json(last, updated.to_json())
+        except ValueError:
+            pass
+    return updated
+
+
+record_app = typer.Typer(
+    help="Sign and verify run records (tamper-evident statements of what proof-ci reported).",
+    no_args_is_help=True,
+    rich_markup_mode=None,
+    pretty_exceptions_enable=False,
+)
+app.add_typer(record_app, name="record")
+
+
+@record_app.command("keygen")
+@common_options
+def record_keygen(
+    force: Annotated[bool, typer.Option("--force", help="Replace an existing key.")] = False,
+    key: Annotated[Path | None, typer.Option("--key", metavar="PATH")] = None,
+    *,
+    common: CommonOptions,
+) -> None:
+    """Create an Ed25519 signing key (owner-only) and its .pub public key."""
+    from proof_ci.record import KeyError_, generate_keypair, resolve_key_path
+
+    cfg = None
+    try:
+        cfg = load_config(common.repo, common.config)
+    except ConfigError:
+        cfg = None
+    path = resolve_key_path(cfg, key)
+    try:
+        pub = generate_keypair(path, force=force)
+    except KeyError_ as exc:
+        raise _fail(str(exc), EXIT_USAGE) from exc
+    except OSError as exc:
+        raise _fail(f"cannot write {path}: {exc}", EXIT_RUNTIME) from exc
+    if common.json_output:
+        emit_json({"key_path": path.as_posix(), "public_key_path": pub.as_posix()})
+        return
+    typer.echo(f"Private key: {path}")
+    typer.echo(f"Public key:  {pub}")
+    typer.echo("To accept records from this key, add the .pub path to [record].trusted_pubkeys.")
+
+
+@record_app.command("sign")
+@common_options
+def record_sign(
+    run_id: Annotated[str | None, typer.Option("--run", metavar="RUN_ID")] = None,
+    output: Annotated[Path | None, typer.Option("--output", metavar="PATH")] = None,
+    key: Annotated[Path | None, typer.Option("--key", metavar="PATH")] = None,
+    agent_id: Annotated[str | None, typer.Option("--agent-id", metavar="ID")] = None,
+    *,
+    common: CommonOptions,
+) -> None:
+    """Sign a run that `proof-ci run` produced (default: the last run)."""
+    try:
+        cfg = load_config(common.repo, common.config)
+    except ConfigError as exc:
+        raise _fail(str(exc), EXIT_USAGE) from exc
+    runs = cfg.repo_root / ".proof-ci" / "runs"
+    if run_id is None:
+        last = cfg.repo_root / ".proof-ci" / "last-run.json"
+        try:
+            run_id = str(json.loads(last.read_text(encoding="utf-8"))["run_id"])
+        except (OSError, ValueError, KeyError) as exc:
+            raise _fail("no last run found; run `proof-ci run` first", EXIT_USAGE) from exc
+    import uuid as _uuid
+
+    try:
+        run_dir = runs / str(_uuid.UUID(run_id))
+    except ValueError as exc:
+        raise _fail(f"--run {run_id!r} is not a run id", EXIT_USAGE) from exc
+    if not (run_dir / "summary.json").is_file():
+        raise _fail(f"no run directory for {run_id}", EXIT_USAGE)
+    try:
+        out = _record_output(cfg, run_dir, output)
+        signed = _sign(cfg, run_dir, agent_id, key, out, recheck_tree=True)
+    except _SignFailure as exc:
+        raise _fail(exc.message, exc.code) from exc
+    from proof_ci.models import RunSummary
+
+    summary = RunSummary.model_validate(
+        json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
+    )
+    _attach_record(cfg, run_dir, summary, signed)
+    if common.json_output:
+        emit_json(
+            {
+                "record_path": signed.path.as_posix(),
+                "run_id": run_id,
+                "key_id": signed.record["signature"]["key_id"],
+            }
+        )
+    else:
+        typer.echo(f"Signed {signed.path} (key {signed.record['signature']['key_id']})")
+
+
+@record_app.command("verify")
+@common_options
+def record_verify(
+    path: Annotated[Path, typer.Argument(metavar="PATH")],
+    pubkey: Annotated[
+        Path | None, typer.Option("--pubkey", metavar="PATH", help="Trust only this public key.")
+    ] = None,
+    key: Annotated[
+        Path | None,
+        typer.Option("--key", metavar="PATH", help="Trust the public half of this private key."),
+    ] = None,
+    require_known_key: Annotated[
+        bool,
+        typer.Option("--require-known-key", help="Fail unless the signer is a trusted key."),
+    ] = False,
+    *,
+    common: CommonOptions,
+) -> None:
+    """Verify a record: integrity always, identity only against trusted keys."""
+    from proof_ci.record import (
+        KeyError_,
+        load_private_key,
+        load_public_key,
+        verify_record,
+    )
+
+    trusted: list[bytes] = []
+    try:
+        if pubkey is not None:
+            trusted = [load_public_key(pubkey)]
+        elif key is not None:
+            private, _warnings = load_private_key(key)
+            from cryptography.hazmat.primitives import serialization
+
+            trusted = [
+                private.public_key().public_bytes(
+                    serialization.Encoding.Raw, serialization.PublicFormat.Raw
+                )
+            ]
+        else:
+            try:
+                cfg = load_config(common.repo, common.config)
+                trusted = [load_public_key(cfg.resolve(p)) for p in cfg.record.trusted_pubkeys]
+            except ConfigError:
+                trusted = []
+    except KeyError_ as exc:
+        raise _fail(str(exc), EXIT_USAGE) from exc
+    result = verify_record(path, trusted, require_known_key=require_known_key)
+    if result.valid and result.signer == "unknown":
+        _warn("verified against the embedded public key: this proves integrity, not identity")
+    if common.json_output:
+        emit_json(result.as_json())
+    elif result.valid:
+        typer.echo(f"valid: run {result.run_id}, key {result.key_id}, signer {result.signer}")
+    else:
+        typer.echo(f"invalid: {result.reason}")
+    raise typer.Exit(0 if result.valid else EXIT_VERIFY)

@@ -488,25 +488,33 @@ def _root_owner_warning(repo_root: Path) -> str | None:
 def _key_step(no_key: bool, config_dir: Path | None) -> tuple[bool, str | None, str | None]:
     """Return (key_created, key_skipped_reason, warning).
 
-    TODO(M8): generate the Ed25519 signing key here (spec Section 4.7). Until
-    then init never creates a key and says so; it only checks that the config
-    directory is usable so an unwritable or ephemeral HOME is reported now.
+    Generates the Ed25519 signing key at the default location when none exists
+    (spec Section 5.7.1 step 5). Never fails init because of the key.
     """
     if no_key:
         return False, "--no-key", None
     target = config_dir if config_dir is not None else user_config_dir()
+    key_path = target / "ed25519.pem"
+    if key_path.exists():
+        return False, f"a signing key already exists at {key_path.as_posix()}", None
     try:
         target.mkdir(parents=True, exist_ok=True)
         probe = target / ".proof-ci-write-probe"
         probe.write_bytes(b"")
         probe.unlink()
+        from proof_ci.record import KeyError_, generate_keypair
+
+        try:
+            generate_keypair(key_path)
+        except KeyError_ as exc:
+            return False, str(exc), f"no signing key was created: {exc}"
     except OSError as exc:
         warning = (
             f"config directory {target} is not writable ({exc.strerror or exc}); "
             "no signing key was created. Point PROOF_CI_SIGNING_KEY at a persistent key to sign records."
         )
         return False, f"config directory not writable: {target.as_posix()}", warning
-    return False, "key generation is not implemented yet (milestone M8)", None
+    return True, None, None
 
 
 def init_repo(
