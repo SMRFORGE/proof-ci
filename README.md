@@ -93,11 +93,11 @@ structured, so only work worth promoting reaches the expensive pipeline.
 
 ```mermaid
 flowchart TB
-  G[git diff vs base<br/>auto = merge-base] --> F{Config or lockfile<br/>changed since last run?}
-  F -->|yes| ALL[Select every test]
+  G[git diff vs base<br/>auto = merge-base] --> F{Config changed, or a change<br/>the import graph cannot trace?}
+  F -->|yes| ALL[Select every test<br/>no cache reads]
   F -->|no| IG[Import graph:<br/>changed files to dependent tests]
   IG --> SEL[Selected tests]
-  ALL --> SEL
+  ALL --> PY
   SEL --> K{Cached pass with<br/>identical inputs?}
   K -->|yes| R[Replay result<br/>cache_hit: true]
   K -->|no| PY[pytest subprocess<br/>with the proof-ci plugin]
@@ -107,14 +107,21 @@ flowchart TB
   S --> SIG[Optional: signed RunRecord]
 ```
 
-- **Selection is conservative.** When unsure it runs more, not fewer. A change to `pyproject.toml`,
-  the root `conftest.py`, a lockfile, or CI config runs everything, but only once per branch: the
-  next run compares against the tree of the last run and goes back to normal selection.
+- **When unsure, it runs the full suite.** A change to `pyproject.toml`, the root `conftest.py`, a
+  lockfile, or CI config runs everything. So does any change the import graph cannot trace to a test:
+  a Python file no collected test reaches by import (a pytest plugin loaded by entry point or `-p`,
+  a script a test launches as a subprocess, a module loaded by file path, or anything such a file
+  imports), package data under a source root, and a data file named by non-test code. These full
+  runs never replay the cache. After a full run that passes, later runs on the branch go back to
+  normal selection until one of those files changes again; a failing full run keeps the full run on.
 - **The base defaults to `auto`:** the merge-base with your default branch, so a committed change
   on a clean tree still selects the tests it affects. A run that selects nothing says why, and is
   never signed.
-- **Known gaps:** dynamic imports (`importlib.import_module`) are handled conservatively, not
-  completely, and data files are matched only when a test file mentions their name or path.
+- **Data files** (including docs such as `README.md`) select the tests whose file mentions their
+  name or path. A data file nothing names selects nothing. Dynamic imports
+  (`importlib.import_module`) are handled conservatively, not completely.
+- **`run --all` executes every test fresh,** never from the cache. A test file that fails to collect
+  is reported as an `error` result for that file, not a crash.
 - **The cache** stores only passing, skipped, and xfail results, keyed by the test file, its import
   closure, the `conftest.py` chain, the pytest config, referenced data files, the interpreter, and
   the installed packages. Failures always re-run.
@@ -268,11 +275,18 @@ Requires git 2.0 or newer.
   instructions to proof-ci, but your tests still run as you.
 - **Python and pytest only** in Phase 1. `test_command` must be a pytest invocation; discovery may
   suggest `tox` or `make test`, but proof-ci will not execute them.
-- **Selection can under-select** when code is loaded dynamically or a data file is never named in a
-  test. Selection runs more tests when unsure, but it is not complete.
+- **Selection can still under-select** when a test reaches code through a path that leaves no trace
+  in the source: a module name built at runtime, a file read through a computed path, or a test
+  that depends on files outside the repository. Untraceable changes the graph can see force a full
+  run, but static analysis is not complete. Your CI's full run remains the backstop.
+- **Source edits often select most of the suite.** In a package where most tests import the
+  package's top level, editing almost any module selects nearly every test. proof-ci then helps by
+  structure, flake flags, and replaying unchanged results, not by running fewer tests.
 - **Some inputs are not tracked.** Environment variables are not part of the cache key, so a cached
-  pass is replayed even if a variable the test reads has changed (use `--no-cache`). A data file read
-  by source code, rather than named in a test file, selects nothing when it changes.
+  pass is replayed even if a variable the test reads has changed (use `--no-cache` or `--all`).
+- **Flakes are judged on identical trees.** A test is flagged flaky only when it passes and fails on
+  the same working tree, so an edit and its revert never look like a flip. Flake detection therefore
+  needs repeated runs without edits in between.
 - **The test process is trusted.** Tests and `conftest.py` run inside the same pytest process that
   reports results, so hostile test code could report anything. A record states what proof-ci
   reported; it cannot vouch for the test code itself.

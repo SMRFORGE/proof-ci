@@ -22,6 +22,21 @@ __all__ = ["CollectOutput", "PytestRunner", "RunOutput", "RunnerError"]
 
 PLUGIN_ARGS = ("-p", "proof_ci.pytest_plugin")
 
+# Above this many characters of test ids or paths, pass them through a pytest
+# ``@argfile`` (pytest >= 8.2) instead of argv. Windows caps a command line at
+# 32,767 characters; a suite of a few hundred parametrized ids exceeds it.
+ARGFILE_THRESHOLD = 8000
+
+
+def _maybe_argfile(items: list[str], work_dir: Path, name: str) -> list[str]:
+    if sum(len(i) + 3 for i in items) <= ARGFILE_THRESHOLD:
+        return list(items)
+    if any("\n" in i or "\r" in i for i in items):
+        return list(items)
+    path = work_dir / name
+    path.write_text("".join(f"{i}\n" for i in items), encoding="utf-8")
+    return [f"@{path}"]
+
 
 def resolve_command(command: tuple[str, ...]) -> list[str]:
     """Resolve ``command[0]`` through PATH before launching.
@@ -70,6 +85,8 @@ class CollectOutput:
     installed: list[str]
     items: list[dict[str, Any]]
     stdout: str
+    errors: list[dict[str, Any]] = field(default_factory=list)
+    """Collectors that failed (pytest exit 2): reported as error results, never a crash."""
 
 
 @dataclass(frozen=True)
@@ -82,6 +99,7 @@ class RunOutput:
     stderr: str
     argv: list[str] = field(default_factory=list)
     installed: list[str] = field(default_factory=list)
+    errors: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -181,7 +199,8 @@ class PytestRunner:
         self.preflight()
         out_file = self.work_dir / "collect.json"
         out_file.unlink(missing_ok=True)
-        args = ["--collect-only", "-q", *PLUGIN_ARGS, "-p", "no:xdist", *extra_args, *paths]
+        args = ["--collect-only", "-q", *PLUGIN_ARGS, "-p", "no:xdist", *extra_args]
+        args += _maybe_argfile(paths, self.work_dir, "collect-args.txt")
         proc = self._spawn(args, COLLECT_ENV, out_file)
         data = self._read(out_file)
         if data is None:
@@ -192,7 +211,10 @@ class PytestRunner:
                 "pytest could not find the requested tests (usage error):\n"
                 + redact((proc.stdout + proc.stderr).strip()[-2000:])
             )
-        if proc.returncode not in (0, 5):
+        errors = [e for e in data.get("errors", []) if isinstance(e, dict)]
+        if proc.returncode == 2 and errors:
+            pass  # collection errors: reported as error results by the caller
+        elif proc.returncode not in (0, 5):
             raise RunnerError(
                 f"pytest collection failed (exit {proc.returncode}):\n{redact((proc.stdout + proc.stderr).strip()[-4000:])}"
             )
@@ -203,13 +225,14 @@ class PytestRunner:
             installed=list(data.get("installed", [])),
             items=list(data.get("items", [])),
             stdout=proc.stdout,
+            errors=errors,
         )
 
     def run(self, test_ids: list[str], extra_args: tuple[str, ...] = ()) -> RunOutput:
         self.preflight()
         out_file = self.work_dir / "plugin-results.json"
         out_file.unlink(missing_ok=True)
-        args = [*PLUGIN_ARGS, *extra_args, *test_ids]
+        args = [*PLUGIN_ARGS, *extra_args, *_maybe_argfile(test_ids, self.work_dir, "run-args.txt")]
         proc = self._spawn(args, RESULTS_ENV, out_file)
         data = self._read(out_file)
         if data is None:
@@ -227,4 +250,5 @@ class PytestRunner:
             stdout=proc.stdout,
             stderr=proc.stderr,
             argv=[*self.test_command, *args],
+            errors=[e for e in data.get("errors", []) if isinstance(e, dict)],
         )

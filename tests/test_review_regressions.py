@@ -358,3 +358,63 @@ def test_keygen_explicit_key_beats_environment(
     explicit = tmp_path / "explicit.pem"
     assert cli.invoke(app, ["record", "keygen", "--key", str(explicit)]).exit_code == 0
     assert explicit.is_file() and not env_key.exists()
+
+
+# ----------------------------------------------------------- M13 empirical findings
+
+
+def test_edit_and_revert_of_an_untraced_input_is_never_flaky(demo: Path) -> None:
+    # The test's own inputs (test file + import closure) do not include factor.txt, which
+    # source code reads: an edit/revert cycle must not look like a pass/fail flip.
+    write(
+        demo,
+        "src/demo/factor.py",
+        "from pathlib import Path\n\n\ndef factor():\n"
+        "    return int((Path(__file__).parent / 'factor.txt').read_text())\n",
+    )
+    write(demo, "src/demo/factor.txt", "2\n")
+    write(
+        demo,
+        "tests/test_factor.py",
+        "from demo.factor import factor\n\n\ndef test_factor():\n    assert factor() == 2\n",
+    )
+    git(demo, "add", "-A")
+    git(demo, "commit", "-q", "-m", "factor")
+    tid = "tests/test_factor.py::test_factor"
+    for _ in range(3):
+        write(demo, "src/demo/factor.txt", "3\n")
+        _, broken, _ = run(demo, "--all")
+        assert results(demo, broken)[tid]["outcome"] == "failed"
+        write(demo, "src/demo/factor.txt", "2\n")
+        _, fixed, _ = run(demo, "--all")
+        assert results(demo, fixed)[tid]["outcome"] == "passed"
+    write(demo, "src/demo/factor.txt", "3\n")
+    code, last, _ = run(demo, "--all", "--allow-known-flakes")
+    row = results(demo, last)[tid]
+    assert row["outcome"] == "failed"
+    assert row["flaky"]["status"] == "none"
+    assert code == 1
+
+
+def test_long_selection_goes_through_an_argfile(
+    demo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from proof_ci.adapters.runners import pytest_runner
+
+    monkeypatch.setattr(pytest_runner, "ARGFILE_THRESHOLD", 0)
+    _, summary, err = run(demo, "--all")
+    assert summary, err
+    assert summary["counts"]["passed"] == 6 and summary["counts"]["failed"] == 1
+    run_dir = demo / Path(summary["results_path"]).parent
+    lines = (run_dir / "run-args.txt").read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 7 and all("::" in ln for ln in lines)
+
+
+def test_argfile_skipped_for_short_lists_and_unsafe_ids(tmp_path: Path) -> None:
+    from proof_ci.adapters.runners.pytest_runner import _maybe_argfile
+
+    assert _maybe_argfile(["a::b"], tmp_path, "x.txt") == ["a::b"]
+    long = [f"tests/test_x.py::test_{i}" for i in range(2000)]
+    out = _maybe_argfile(long, tmp_path, "x.txt")
+    assert out == [f"@{tmp_path / 'x.txt'}"]
+    assert _maybe_argfile([*long, "a\nb"], tmp_path, "y.txt")[-1] == "a\nb"

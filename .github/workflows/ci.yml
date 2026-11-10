@@ -79,3 +79,18 @@ jobs:
           python-version: "3.12"
       - run: python -m pip install -e ".[dev]" pytest-github-actions-annotate-failures
       - run: python -m pytest -q -rfE
+
+  test-mcp-matrix:
+    # The MCP server supports mcp 1.x and 2.x low-level APIs; exercise both ends.
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        mcp: ["mcp>=1.10,<2", "mcp>=2,<3"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: python -m pip install -e ".[dev]" "${{ matrix.mcp }}"
+      - run: python -m pytest -q -rfE tests/test_mcp.py tests/test_conformance_generic_client.py

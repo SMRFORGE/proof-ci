@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal
 
+from proof_ci._plugin_protocol import repro_command
 from proof_ci.adapters.agent.identity import resolve_identity
 from proof_ci.adapters.runners.pytest_runner import (
     PytestRunner,
@@ -35,6 +36,7 @@ from proof_ci.affected import (
     references_data_file,
     resolve_base,
     select,
+    untraced_changes,
 )
 from proof_ci.cache import (
     CACHEABLE_OUTCOMES,
@@ -50,7 +52,7 @@ from proof_ci.cache import (
     trim_caches,
 )
 from proof_ci.config import Config, ConfigError
-from proof_ci.flakes import code_hash, flake_store
+from proof_ci.flakes import OutcomeRow, code_hash, flake_store
 from proof_ci.models import (
     CacheStats,
     Counts,
@@ -160,7 +162,16 @@ def _validate_test_args(cfg: Config, tests: tuple[str, ...]) -> None:
             raise ConfigError(f"test argument {arg!r} resolves outside the repository") from exc
 
 
-def _previous_failed(cfg: Config) -> list[str]:
+INCOMPLETE_MARKER = "run-in-progress"
+
+
+def _previous_failed(cfg: Config, *, check_marker: bool = True) -> list[str]:
+    marker = cfg.repo_root / STATE_DIR / INCOMPLETE_MARKER
+    if check_marker and marker.is_file():
+        raise ConfigError(
+            "the last run did not finish (it crashed or was interrupted), so its failures "
+            "are unknown; run `proof-ci run` or `proof-ci run --all` first"
+        )
     last = cfg.repo_root / STATE_DIR / "last-run.json"
     if not last.is_file():
         raise ConfigError(
@@ -192,6 +203,39 @@ def _canonicalise(raw: dict[str, Any], case: CaseIndex) -> dict[str, Any]:
     loc["file"] = case.canonical(loc["file"])
     raw["location"] = loc
     return raw
+
+
+def _collect_error_result(err: dict[str, Any], case: CaseIndex) -> TestResult:
+    """A collector pytest could not collect (e.g. ImportError in a test file), as an error
+    result: plain pytest reports it as an error, so proof-ci must too (M13 E2)."""
+    nodeid = case.canonical_node_id(str(err.get("nodeid") or "."))
+    file = case.canonical(str(err.get("file") or nodeid.split("::", 1)[0] or "."))
+    longrepr = str(err.get("longrepr") or "")
+    last = next(
+        (ln.strip() for ln in reversed(longrepr.splitlines()) if ln.strip()), "collection failed"
+    )
+    last = last[1:].strip() if last.startswith("E ") else last
+    error_type, sep, message = last.partition(": ")
+    if not sep or not error_type.replace(".", "").replace("_", "").isalnum():
+        error_type, message = "CollectionError", last
+    return TestResult.model_validate(
+        {
+            "schema_version": "1.0.0",
+            "test_id": nodeid,
+            "outcome": "error",
+            "duration_ms": 0,
+            "location": {"file": file, "line": 1},
+            "message": f"collection error: {message}"[:500],
+            "cache_hit": False,
+            "failure": {
+                "error_type": error_type.rsplit(".", 1)[-1],
+                "error_message": message[:2000],
+                "file": file,
+                "traceback": longrepr,
+                "repro_command": repro_command(nodeid),
+            },
+        }
+    )
 
 
 def _counts(results: list[TestResult]) -> Counts:
@@ -247,6 +291,7 @@ class SelectionPlan:
     graph: ImportGraph | None = None
     no_cache_files: set[str] = field(default_factory=set)
     notes: list[str] = field(default_factory=list)
+    collect_errors: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -271,7 +316,7 @@ def _branch(repo: Path) -> str | None:
 
 def _collect(
     cfg: Config, runner: PytestRunner, paths: list[str], use_cache: bool
-) -> tuple[list[dict[str, Any]], CollectEntry | None, CollectEnv]:
+) -> tuple[list[dict[str, Any]], CollectEntry | None, CollectEnv, list[dict[str, Any]]]:
     """Collect through the plugin, reusing the collection cache when its key matches.
 
     Returns the items, the cache entry when they came from the cache, and the
@@ -279,7 +324,8 @@ def _collect(
     """
     if not use_cache:
         out = runner.collect(paths)
-        return out.items, None, CollectEnv(out.python, out.platform, out.installed, out.inipath)
+        env = CollectEnv(out.python, out.platform, out.installed, out.inipath)
+        return out.items, None, env, out.errors
     cache = CollectCache(cfg.resolve(cfg.cache.collect_cache_dir))
     key = collect_cache_key(
         cfg.repo_root, cfg.project.test_paths, cfg.project.pytest_args, cfg.project.test_command
@@ -288,9 +334,12 @@ def _collect(
     if entry is not None:
         debug("collection: cached")
         env = CollectEnv(entry.python, entry.platform, entry.installed, entry.inipath)
-        return entry.items, entry, env
+        return entry.items, entry, env, []
     debug("collection: fresh")
     out = runner.collect(paths)
+    env = CollectEnv(out.python, out.platform, out.installed, out.inipath)
+    if out.errors:
+        return out.items, None, env, out.errors  # never cache a broken collection
     cache.put(
         CollectEntry(
             key=key,
@@ -302,7 +351,7 @@ def _collect(
             written_at=time.time(),
         )
     )
-    return out.items, None, CollectEnv(out.python, out.platform, out.installed, out.inipath)
+    return out.items, None, env, []
 
 
 def plan_selection(
@@ -342,7 +391,7 @@ def plan_selection(
         if options.mode == "explicit"
         else list(cfg.project.test_paths)
     )
-    items, entry, env = _collect(cfg, runner, paths, use_cache)
+    items, entry, env, collect_errors = _collect(cfg, runner, paths, use_cache)
     collected_ids = [case.canonical_node_id(i["test_id"]) for i in items]
     invoke_id = {case.canonical_node_id(i["test_id"]): i["test_id"] for i in items}
     item_file = {case.canonical_node_id(i["test_id"]): case.canonical(i["file"]) for i in items}
@@ -356,15 +405,19 @@ def plan_selection(
         tree_last = None
         if branch:
             tree_last = SavingsLedger(cfg.resolve(cfg.savings.db)).last_tree(branch)
+        graph = ImportGraph.build(
+            cfg.repo_root, cfg.project.source_roots, cfg.project.test_paths, changed
+        )
+        untraced = untraced_changes(
+            graph, changed, set(item_file.values()), cfg.project.source_roots
+        )
         fallback = decide_fallback(
             cfg.repo_root,
             changed,
             cfg.affected.fallback_full_run_globs,
             tree_now=info.tree,
             tree_last=tree_last,
-        )
-        graph = ImportGraph.build(
-            cfg.repo_root, cfg.project.source_roots, cfg.project.test_paths, changed
+            extra_triggers=untraced,
         )
         chosen = select(
             cfg.repo_root, changed, [(t, item_file[t]) for t in collected_ids], graph, fallback
@@ -374,8 +427,10 @@ def plan_selection(
         for path in chosen.unmatched_data_files:
             debug(f"changed non-Python file {path} is not referenced by any test file")
     elif options.mode == "failed":
-        previous = set(_previous_failed(cfg))
-        selected = [t for t in collected_ids if t in previous]
+        previous = set(_previous_failed(cfg, check_marker=False))  # checked before the run
+        # A collection error is reported under the file's node id; once the file collects
+        # again, rerun every test in it.
+        selected = [t for t in collected_ids if t in previous or item_file[t] in previous]
         if not selected:
             gone = sorted(previous - set(collected_ids))
             notes.append(
@@ -427,6 +482,7 @@ def plan_selection(
         graph=graph,
         no_cache_files=no_cache_files,
         notes=notes,
+        collect_errors=collect_errors,
     )
 
 
@@ -615,6 +671,14 @@ def _savings(
             collected_count=len(plan.collected_ids),
             duration_ms=summary.duration_ms,
             mode=plan.mode,
+            full_green=(
+                plan.mode in ("affected", "all")
+                and bool(plan.selected)
+                and len(plan.selected) == len(plan.collected_ids)
+                and not hits
+                and summary.counts.failed + summary.counts.error == 0
+                and summary.outcome == "passed"
+            ),
         )
     )
     return savings
@@ -636,6 +700,10 @@ def execute_run(cfg: Config, options: RunOptions) -> RunOutcome:
     run_id = uuid.uuid4()
     run_dir = cfg.repo_root / STATE_DIR / "runs" / str(run_id)
     run_dir.mkdir(parents=True, exist_ok=True)
+    # Removed once last-run.json describes this run; while it exists `--failed` refuses
+    # to trust the previous run's failures (M13 C6).
+    marker = cfg.repo_root / STATE_DIR / INCOMPLETE_MARKER
+    marker.write_text(str(run_id) + "\n", encoding="utf-8")
 
     info, case = _git_state(cfg)
     runner = PytestRunner(cfg.repo_root, cfg.project.test_command, run_dir)
@@ -648,8 +716,15 @@ def execute_run(cfg: Config, options: RunOptions) -> RunOutcome:
         raise RunError(str(exc)) from exc
 
     cache_on = cfg.cache.enabled and not options.no_cache
-    # Reads are skipped only when the fallback actually fired (Section 5.9).
-    read_cache = cache_on and not plan.selection.fallback_full_run and not options.calibrate
+    # Reads are skipped when the fallback fired (a change selection cannot trace, so the
+    # cache keys cannot capture it either) and under --all, which promises a fresh run of
+    # every test (M13: replaying passes under --all hid real failures).
+    read_cache = (
+        cache_on
+        and not plan.selection.fallback_full_run
+        and not options.calibrate
+        and plan.mode != "all"
+    )
     result_cache = ResultCache(cfg.resolve(cfg.cache.dir))
     # Keys also give each test its code_hash for the flake store.
     keys = _KeyBuilder(cfg, plan) if plan.selected else None
@@ -677,11 +752,29 @@ def execute_run(cfg: Config, options: RunOptions) -> RunOutcome:
 
     pytest_ms = 0
 
-    def execute(ids: list[str]) -> RunOutput:
+    collect_errors: dict[str, dict[str, Any]] = {
+        str(e.get("nodeid")): e for e in plan.collect_errors
+    }
+
+    def execute(ids: list[str], retry: bool = True) -> RunOutput:
         nonlocal pytest_ms
         started_pytest = time.monotonic()
         out = runner.run([plan.invoke_id[t] for t in ids], extra)
         pytest_ms += round((time.monotonic() - started_pytest) * 1000)
+        if out.returncode == 2 and out.errors:
+            # A selected file no longer collects (pytest then runs nothing at all): report
+            # the error, drop the stale collection, and run the rest once more.
+            for err in out.errors:
+                collect_errors[str(err.get("nodeid"))] = err
+            if plan.collect_entry is not None:
+                CollectCache(cfg.resolve(cfg.cache.collect_cache_dir)).delete(
+                    plan.collect_entry.key
+                )
+            bad = {case.canonical(str(e.get("file") or "")) for e in out.errors}
+            rest = [t for t in ids if plan.item_file[t] not in bad]
+            if len(rest) < len(ids):
+                stdout_parts.append(out.stdout)
+                return execute(rest, retry=False) if rest and retry else out
         _check_run(out, ids, case)
         wanted = set(ids)
         stdout_parts.append(out.stdout)
@@ -742,27 +835,39 @@ def execute_run(cfg: Config, options: RunOptions) -> RunOutcome:
         raise RunError(str(exc)) from exc
 
     # Flake history: freshly executed outcomes only, never cache replays (Section 5.9).
+    # A test is flaky only if it passes and fails on the same code, and the import graph
+    # cannot see every input (plugins, subprocesses, data read by code). So outcomes are
+    # grouped by the whole working tree as well as the test's own inputs: an edit and its
+    # revert never count as a flip (M13 C5).
     code_hashes: dict[str, str] = {}
     if keys is not None:
+        tree = {":tree": info.tree} if info.tree else {}
         for test_id in plan.selected:
             inputs = keys.inputs(plan.item_file[test_id], env.inipath)
-            code_hashes[test_id] = code_hash(test_id, inputs)
-        for test_id, result in executed.items():
-            store.record(
-                test_id=test_id,
-                code_hash=code_hashes[test_id],
-                outcome=result.outcome,
-                started_at=utc_now_iso(),
-                duration_ms=result.duration_ms,
-                run_id=str(run_id),
-                commit_sha=info.sha,
-                error_message=result.failure.error_message[:500] if result.failure else None,
-            )
+            code_hashes[test_id] = code_hash(test_id, {**inputs, **tree})
+        now = utc_now_iso()
+        store.record_many(
+            [
+                OutcomeRow(
+                    test_id,
+                    code_hashes[test_id],
+                    result.outcome,
+                    now,
+                    result.duration_ms,
+                    str(run_id),
+                    info.sha,
+                    result.failure.error_message[:500] if result.failure else None,
+                )
+                for test_id, result in executed.items()
+            ]
+        )
     flakes_after = store.snapshot()
     results = [
         (hits[t] if t in hits else executed[t]).model_copy(update={"flaky": flakes_after.info(t)})
         for t in plan.selected
+        if t in hits or t in executed  # tests in a file that stopped collecting are not
     ]
+    results.extend(_collect_error_result(err, case) for err in collect_errors.values())
     pytest_stdout = "".join(stdout_parts)
     if stdout_parts:
         (run_dir / "pytest-stdout.txt").write_text(
@@ -867,6 +972,7 @@ def execute_run(cfg: Config, options: RunOptions) -> RunOutcome:
     # The interpreter that ran pytest, for RunRecord.payload.environment (M8).
     _write_json(run_dir / "environment.json", {"python": env.python, "platform": env.platform})
     _write_json(cfg.repo_root / STATE_DIR / "last-run.json", summary.to_json())
+    marker.unlink(missing_ok=True)
 
     exit_code = 1 if blocking else 0
     return RunOutcome(

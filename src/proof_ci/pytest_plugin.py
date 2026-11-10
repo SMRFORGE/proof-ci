@@ -50,6 +50,17 @@ def _installed() -> list[str]:
     return sorted(seen)
 
 
+def _collect_error(config: pytest.Config, report: pytest.CollectReport) -> dict[str, Any]:
+    """A file (or other collector) that failed to collect, e.g. an ImportError at import."""
+    nodeid = report.nodeid or "."
+    file = nodeid.split("::", 1)[0]
+    return {
+        "nodeid": nodeid,
+        "file": _repo_relative(config, file),
+        "longrepr": truncate_and_redact(report.longreprtext or ""),
+    }
+
+
 def _write_json(path: str, data: dict[str, Any]) -> None:
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -65,6 +76,11 @@ class _Collector:
         self.config = config
         self.path = path
         self.items: list[dict[str, Any]] = []
+        self.errors: list[dict[str, Any]] = []
+
+    def pytest_collectreport(self, report: pytest.CollectReport) -> None:
+        if report.failed:
+            self.errors.append(_collect_error(self.config, report))
 
     @pytest.hookimpl(trylast=True)
     def pytest_collection_finish(self, session: pytest.Session) -> None:
@@ -94,6 +110,7 @@ class _Collector:
                 "inipath": ini,
                 "installed": _installed(),
                 "items": self.items,
+                "errors": self.errors,
             },
         )
 
@@ -128,6 +145,11 @@ class _Results:
         self.order: list[str] = []
         self.location: dict[str, tuple[str, int | None, str]] = {}
         self.phases: dict[str, dict[str, _Phase]] = {}
+        self.errors: list[dict[str, Any]] = []
+
+    def pytest_collectreport(self, report: pytest.CollectReport) -> None:
+        if report.failed and not _is_worker(self.config):
+            self.errors.append(_collect_error(self.config, report))
 
     @pytest.hookimpl(hookwrapper=True)
     def pytest_runtest_makereport(
@@ -165,6 +187,7 @@ class _Results:
                 "platform": platform.system(),
                 "installed": _installed(),
                 "results": results,
+                "errors": self.errors,
             },
         )
 

@@ -30,9 +30,11 @@ __all__ = [
     "glob_match",
     "is_test_file",
     "likely_cause",
+    "loaded_conftests",
     "references_data_file",
     "resolve_base",
     "select",
+    "untraced_changes",
 ]
 
 IGNORED_DIRS = frozenset(
@@ -171,12 +173,27 @@ def decide_fallback(
     *,
     tree_now: str | None,
     tree_last: str | None,
+    extra_triggers: Iterable[tuple[str, str]] = (),
 ) -> FallbackDecision:
-    """Step 3 including the incremental rule."""
-    matches = [(path, g) for path in changed for g in globs if glob_match(path, g)]
+    """Step 3 including the incremental rule.
+
+    ``extra_triggers`` are ``(path, why)`` pairs for changes selection cannot trace
+    (see :func:`untraced_changes`); they fire the full run exactly like a glob match.
+    ``tree_last`` must be the tree of the last *green full* run on the branch: the
+    fallback is suppressed only when none of the triggering files changed since then.
+    """
+    matches = [
+        (path, f"{path} matched fallback glob '{g}'")
+        for path in changed
+        for g in globs
+        if glob_match(path, g)
+    ]
+    matches.extend(extra_triggers)
     if not matches:
         return FallbackDecision(False, None)
-    described = ", ".join(f"{p} matched fallback glob '{g}'" for p, g in matches)
+    described = ", ".join(why for _, why in matches[:5]) + (
+        f" (+{len(matches) - 5} more)" if len(matches) > 5 else ""
+    )
     if tree_now and tree_last and tree_now != tree_last:
         proc = run_git(
             repo, "diff-tree", "-r", "--name-only", "-z", tree_last, tree_now, check=False
@@ -225,6 +242,28 @@ def _walk_py(repo: Path, start: Path) -> Iterable[str]:
                     stack.append(entry)
             elif entry.suffix == ".py":
                 yield entry.relative_to(repo).as_posix()
+
+
+def _repo_py_files(repo: Path) -> list[str]:
+    """Tracked and untracked (not ignored) ``.py`` files; empty outside git."""
+    try:
+        proc = run_git(
+            repo, "ls-files", "-z", "--cached", "--others", "--exclude-standard", check=False
+        )
+    except GitError:
+        return []
+    if proc.returncode != 0:
+        return []
+    out = []
+    for path in proc.stdout.split("\0"):
+        parts = path.split("/")
+        if (
+            path.endswith(".py")
+            and not any(p in IGNORED_DIRS or p.endswith(".egg-info") for p in parts[:-1])
+            and (repo / path).is_file()
+        ):
+            out.append(path)
+    return out
 
 
 def _is_dynamic(tree: ast.AST) -> bool:
@@ -286,8 +325,10 @@ class ImportGraph:
         self.rdeps: dict[str, set[str]] = defaultdict(set)
         self.dynamic: set[str] = set()
         self.opaque: set[str] = set()
+        self.texts: dict[str, str] = {}
         self._file_set = set(self.files)
         self._modules = self._module_map()
+        self._tails = self._tail_map()
         for f in self.files:
             self._add_file(f)
 
@@ -303,6 +344,10 @@ class ImportGraph:
         files: set[str] = set()
         for root in roots:
             files.update(_walk_py(repo, repo / root))
+        # Every other Python file in the repository too: scripts, examples, tools and
+        # servers that tests launch or put on sys.path. They are how code is reached
+        # without an import from a test, which selection must notice (untraced_changes).
+        files.update(_repo_py_files(repo))
         for path in extra:
             parts = PurePosixPath(path).parts
             # Deleted files stay in the graph (opaque) so their importers are still found.
@@ -337,6 +382,20 @@ class ImportGraph:
                 mapping.setdefault(name, f)
         return mapping
 
+    def _tail_map(self) -> dict[str, set[str]]:
+        """Dotted tails of every file's repo path, for imports that only resolve through a
+        ``sys.path`` entry we cannot see (``examples/x`` inserted by a test, say)."""
+        tails: dict[str, set[str]] = defaultdict(set)
+        for f in self.files:
+            parts = list(PurePosixPath(f).with_suffix("").parts)
+            if parts and parts[-1] == "__init__":
+                parts = parts[:-1]
+            for k in range(1, len(parts) + 1):
+                tail = parts[-k:]
+                if all(part.isidentifier() for part in tail):
+                    tails[".".join(tail)].add(f)
+        return tails
+
     def _resolve_relative(
         self, path: str, level: int, module: str | None, names: list[str]
     ) -> set[str]:
@@ -366,6 +425,11 @@ class ImportGraph:
             hit = self._modules.get(".".join(parts[:i]))
             if hit is not None:
                 targets.add(hit)
+        if not targets:
+            # Not importable from a source root or the repo root: link every file that could
+            # provide it from some other directory. Over-linking only selects more tests.
+            for i in range(1, len(parts) + 1):
+                targets |= self._tails.get(".".join(parts[:i]), set())
         return targets
 
     def _add_file(self, path: str) -> None:
@@ -374,6 +438,7 @@ class ImportGraph:
         except OSError:
             self.opaque.add(path)
             return
+        self.texts[path] = source
         parsed = _parse_imports(source)
         if parsed is None:
             self.opaque.add(path)
@@ -413,6 +478,18 @@ class ImportGraph:
         seen.discard(path)
         return seen
 
+    def reached_from(self, roots: Iterable[str]) -> set[str]:
+        """``roots`` plus everything they import, transitively."""
+        seen: set[str] = set()
+        queue = deque(roots)
+        while queue:
+            f = queue.popleft()
+            if f in seen:
+                continue
+            seen.add(f)
+            queue.extend(self.deps.get(f, ()))
+        return seen
+
     def _dependents(self, seeds: Iterable[str]) -> set[str]:
         result: set[str] = set()
         queue = deque(seeds)
@@ -443,18 +520,71 @@ class ImportGraph:
 
 # ---------------------------------------------- Steps 5-6: tests and data files
 
-_DOC_SUFFIXES = (".md", ".rst", ".txt")
+
+def loaded_conftests(graph: ImportGraph, test_files: Iterable[str]) -> set[str]:
+    """conftest.py files pytest loads for these test files (their directory ancestors)."""
+    dirs: set[str] = set()
+    for tf in test_files:
+        parent = PurePosixPath(tf).parent
+        while True:
+            dirs.add(parent.as_posix())
+            if parent == parent.parent:
+                break
+            parent = parent.parent
+    out = set()
+    for f in graph.files:
+        p = PurePosixPath(f)
+        if p.name == "conftest.py" and p.parent.as_posix() in dirs:
+            out.add(f)
+    return out
 
 
-def _is_skippable_doc(path: str) -> bool:
-    p = PurePosixPath(path)
-    if p.suffix.lower() not in _DOC_SUFFIXES and p.name.upper() not in (
-        "LICENSE",
-        "COPYING",
-        "NOTICE",
-    ):
-        return False
-    return len(p.parts) == 1 or p.parts[0] == "docs"
+def untraced_changes(
+    graph: ImportGraph,
+    changed: list[str],
+    test_files: Iterable[str],
+    source_roots: Iterable[str],
+) -> list[tuple[str, str]]:
+    """Changed files whose effect on tests the import graph cannot see (``(path, why)``).
+
+    proof-ci's rule is to run the full suite when unsure. A changed Python file is
+    untraced when it, or anything that imports it, is not reachable by import from a
+    collected test file or a conftest pytest loads for one: such code reaches tests
+    another way (a pytest plugin entry point or ``-p``, a subprocess, a file path, a
+    ``__main__``). A changed non-Python file is untraced when it lives under a source
+    root (package data) or when a non-test Python file names it (data read by code).
+    Data files only a test file names are traced (Step 6 selects those tests).
+    """
+    tests = set(test_files)
+    roots = tests | loaded_conftests(graph, tests)
+    reached = graph.reached_from(roots)
+    orphans = {f for f in graph.files if f not in reached}
+    src = [r.strip("/") for r in source_roots if r.strip("/")]
+    triggers: list[tuple[str, str]] = []
+    for path in changed:
+        if path.endswith(".py"):
+            if path in tests:
+                continue
+            bad = graph._dependents([path]) & orphans
+            if not bad:
+                continue
+            if path in bad:
+                why = f"{path} is not imported by any collected test (it may load as a plugin, subprocess or by path)"
+            else:
+                why = f"{path} is imported by {min(bad)}, which no collected test imports"
+            triggers.append((path, why))
+            continue
+        if any(path == r or path.startswith(r + "/") for r in src):
+            triggers.append((path, f"{path} is package data under a source root"))
+            continue
+        readers = sorted(
+            f
+            for f in graph.files
+            if f not in tests and references_data_file(graph.texts.get(f, ""), path)
+        )
+        if readers:
+            triggers.append((path, f"{path} is named by non-test code {readers[0]}"))
+    return triggers
 
 
 @dataclass(frozen=True)
@@ -497,11 +627,7 @@ def select(
     unmatched: list[str] = []
     texts: dict[str, str] = {}
     for path in changed:
-        if (
-            path.endswith(".py")
-            or PurePosixPath(path).name == "conftest.py"
-            or _is_skippable_doc(path)
-        ):
+        if path.endswith(".py"):
             continue
         hit = False
         for tf in test_files:

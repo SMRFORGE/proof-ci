@@ -474,5 +474,14 @@ def test_ledger_holds_last_tree_for_honouring_runs_only(demo: Path) -> None:
     ledger = SavingsLedger(demo / ".proof-ci" / "savings.sqlite")
     cli.invoke(app, ["run", "tests/test_text.py", "--repo", str(demo)])  # explicit
     assert ledger.last_tree("main") is None
-    cli.invoke(app, ["run", "--all", "--repo", str(demo)])  # honours the fallback
+    cli.invoke(app, ["run", "--all", "--repo", str(demo)])  # full, but one test fails
+    assert ledger.last_tree("main") is None  # a failing full run never suppresses (M13 C4)
+    math = demo / "tests/test_math.py"
+    math.write_text(
+        math.read_text(encoding="utf-8").replace(
+            "def test_div_wrong_expectation", "def _skip_div_wrong_expectation"
+        ),
+        encoding="utf-8",
+    )
+    cli.invoke(app, ["run", "--all", "--repo", str(demo)])  # full and green
     assert ledger.last_tree("main") is not None

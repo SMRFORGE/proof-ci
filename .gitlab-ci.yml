@@ -31,3 +31,12 @@ test:
       - PYTHON: ["3.11", "3.12", "3.13"]
   script:
     - python -m pytest -q
+
+test-mcp-matrix:
+  image: python:3.13
+  parallel:
+    matrix:
+      - MCP_SPEC: ["mcp>=1.10,<2", "mcp>=2,<3"]
+  script:
+    - python -m pip install "$MCP_SPEC"
+    - python -m pytest -q tests/test_mcp.py tests/test_conformance_generic_client.py

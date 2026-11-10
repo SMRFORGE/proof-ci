@@ -230,6 +230,12 @@ class SavingsLedger:
                 # Which selection mode produced the row: only affected/all runs honour the
                 # full-run fallback, so only they may suppress it later (Section 5.8 Step 3).
                 conn.execute("ALTER TABLE savings_ledger ADD COLUMN mode TEXT")
+            if "full_green" not in columns:
+                # 1 when the run executed every collected test fresh and all passed: only
+                # such a run may later suppress the full-run fallback (M13 C4).
+                conn.execute(
+                    "ALTER TABLE savings_ledger ADD COLUMN full_green INTEGER NOT NULL DEFAULT 0"
+                )
             yield conn
             conn.commit()
         finally:
@@ -265,12 +271,16 @@ class SavingsLedger:
         return int(r[0]) if r else 0
 
     def last_tree(self, branch: str) -> str | None:
+        """Tree of the last run on ``branch`` that executed every collected test fresh and
+        passed. The full-run fallback is suppressed only relative to such a run, so a
+        failing full run never makes the next run quietly select less (M13 C4)."""
         if not self.path.exists():
             return None
         with self._connect() as conn:
             r = conn.execute(
                 "SELECT commit_tree FROM savings_ledger WHERE branch = ? AND commit_tree IS NOT NULL "
-                "AND mode IN ('affected', 'all') ORDER BY recorded_at DESC, id DESC LIMIT 1",
+                "AND mode IN ('affected', 'all') AND full_green = 1 "
+                "ORDER BY recorded_at DESC, id DESC LIMIT 1",
                 (branch,),
             ).fetchone()
         return str(r[0]) if r else None
@@ -728,6 +738,7 @@ def ledger_row(
     collected_count: int,
     duration_ms: int,
     mode: str | None = None,
+    full_green: bool = False,
 ) -> dict[str, Any]:
     t = savings.totals
     return {
@@ -756,6 +767,7 @@ def ledger_row(
         "savings_json": json.dumps(savings.to_json(), ensure_ascii=False),
         "record_path": None,
         "mode": mode,
+        "full_green": int(full_green),
     }
 
 

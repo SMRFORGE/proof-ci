@@ -31,7 +31,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from itertools import pairwise
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import rfc8785
 
@@ -44,6 +44,7 @@ __all__ = [
     "RECORDED_OUTCOMES",
     "FlakeSnapshot",
     "FlakeStore",
+    "OutcomeRow",
     "code_hash",
     "flake_store",
     "statuses_for",
@@ -88,6 +89,17 @@ CREATE TABLE IF NOT EXISTS flake_records (
     manual INTEGER NOT NULL DEFAULT 0
 );
 """
+
+
+class OutcomeRow(NamedTuple):
+    test_id: str
+    code_hash: str
+    outcome: str
+    started_at: str
+    duration_ms: int | None
+    run_id: str
+    commit_sha: str | None
+    error_message: str | None
 
 
 def code_hash(test_id: str, input_hashes: dict[str, str]) -> str:
@@ -285,13 +297,9 @@ class FlakeStore:
         error_message: str | None,
     ) -> None:
         """Insert one freshly executed outcome and recompute that test's record."""
-        if outcome not in RECORDED_OUTCOMES:
-            return
-        with self._connect() as conn:
-            conn.execute(
-                "INSERT INTO test_outcomes (test_id, code_hash, outcome, started_at, duration_ms, "
-                "run_id, commit_sha, error_message) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (
+        self.record_many(
+            [
+                OutcomeRow(
                     test_id,
                     code_hash,
                     outcome,
@@ -300,9 +308,36 @@ class FlakeStore:
                     run_id,
                     commit_sha,
                     error_message,
-                ),
+                )
+            ]
+        )
+
+    def record_many(self, rows: list[OutcomeRow]) -> None:
+        """Insert a run's freshly executed outcomes in one transaction (M13 P1: one
+        connection and commit per test cost 10 s of a 27 s run on 1,400 tests)."""
+        rows = [r for r in rows if r.outcome in RECORDED_OUTCOMES]
+        if not rows:
+            return
+        with self._connect() as conn:
+            conn.executemany(
+                "INSERT INTO test_outcomes (test_id, code_hash, outcome, started_at, duration_ms, "
+                "run_id, commit_sha, error_message) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                [
+                    (
+                        r.test_id,
+                        r.code_hash,
+                        r.outcome,
+                        r.started_at,
+                        r.duration_ms,
+                        r.run_id,
+                        r.commit_sha,
+                        r.error_message,
+                    )
+                    for r in rows
+                ],
             )
-            self._recompute(conn, test_id, code_hash)
+            for r in rows:
+                self._recompute(conn, r.test_id, r.code_hash)
 
     def _groups(self, conn: sqlite3.Connection, test_id: str) -> list[_Group]:
         rows = conn.execute(

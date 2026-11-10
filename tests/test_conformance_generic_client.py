@@ -35,6 +35,11 @@ TOOL_NAMES = {
 VENDORS = ("claude", "anthropic", "cursor", "codex", "windsurf", "cline", "copilot", "openai")
 
 
+def _attr(obj: Any, v1: str, v2: str) -> Any:
+    """mcp 1.x exposes camelCase attributes, 2.x snake_case."""
+    return getattr(obj, v1) if hasattr(obj, v1) else getattr(obj, v2)
+
+
 def validator(name: str) -> jsonschema.Draft202012Validator:
     schemas = [m.load_schema(n) for n in m.SCHEMA_FILES]
     registry = Registry().with_resources((s["$id"], Resource.from_contents(s)) for s in schemas)
@@ -104,7 +109,7 @@ async def _mcp_session(repo: Path) -> dict[str, Any]:
     out: dict[str, Any] = {}
     async with stdio_client(params) as (read, write), ClientSession(read, write) as session:
         init = await session.initialize()
-        out["server_name"] = init.serverInfo.name
+        out["server_name"] = _attr(init, "serverInfo", "server_info").name
         tools = await session.list_tools()
         out["tools"] = {t.name: t for t in tools.tools}
 
@@ -128,10 +133,10 @@ async def _mcp_session(repo: Path) -> dict[str, Any]:
 
 
 def single_json(result: Any) -> Any:
-    assert not result.isError, result.content
+    assert not _attr(result, "isError", "is_error"), result.content
     assert len(result.content) == 1 and result.content[0].type == "text"
     data = json.loads(result.content[0].text)
-    assert result.structuredContent == data
+    assert _attr(result, "structuredContent", "structured_content") == data
     return data
 
 
@@ -159,5 +164,5 @@ def test_mcp_stdio_generic_client(demo: Path) -> None:
     assert not list(validator("savings_report").iter_errors(single_json(out["savings"])))
 
     for key in ("unknown_test", "bad_args", "zero_sign"):
-        assert out[key].isError, key
+        assert _attr(out[key], "isError", "is_error"), key
     assert "selected no tests" in out["zero_sign"].content[0].text

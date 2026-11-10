@@ -44,7 +44,8 @@ def demo(tmp_path: Path) -> Path:
 
 
 def run_all(repo: Path, *extra: str) -> dict[str, Any]:
-    result = cli.invoke(app, ["run", "--all", "--json", "--repo", str(repo), *extra])
+    # Every test, by explicit path: explicit runs read the result cache, `--all` does not.
+    result = cli.invoke(app, ["run", "tests", "--json", "--repo", str(repo), *extra])
     data: dict[str, Any] = json.loads(result.stdout)
     # Exit 1 exactly when tests failed or errored, 0 otherwise.
     failing = data["counts"]["failed"] + data["counts"]["error"]
@@ -183,6 +184,14 @@ def test_second_run_hits_and_failures_are_never_cached(demo: Path) -> None:
     assert all(s["outcome"] not in ("failed", "error") for s in stored)
 
 
+def test_run_all_never_replays_the_cache(demo: Path) -> None:
+    run_all(demo)  # warm the cache
+    result = cli.invoke(app, ["run", "--all", "--json", "--repo", str(demo)])
+    data = json.loads(result.stdout)
+    assert data["cache"]["hits"] == 0 and data["cache"]["misses"] == 7
+    assert not any(r["cache_hit"] for r in results_of(demo, data).values())
+
+
 def test_result_cache_refuses_failed_and_error(tmp_path: Path) -> None:
     rc = ResultCache(tmp_path)
     for outcome in ("failed", "error"):
@@ -232,6 +241,14 @@ def test_fired_fallback_reads_nothing(demo: Path) -> None:
     def git(*args: str) -> None:
         subprocess.run([GIT or "git", *args], cwd=demo, env=env, check=True, capture_output=True)
 
+    # Only a green full run may suppress the fallback later: drop the deliberate failure.
+    math = demo / "tests/test_math.py"
+    math.write_text(
+        math.read_text(encoding="utf-8").replace(
+            "def test_div_wrong_expectation", "def _skip_div_wrong_expectation"
+        ),
+        encoding="utf-8",
+    )
     git("init", "-q", "-b", "main")
     git("add", "-A")
     git("commit", "-q", "-m", "init")
@@ -251,8 +268,8 @@ def test_fired_fallback_reads_nothing(demo: Path) -> None:
     result2 = cli.invoke(app, ["run", "--json", "--repo", str(demo)])
     summary2 = json.loads(result2.stdout)
     assert summary2["selection"].get("fallback_suppressed_by_tree")
-    assert summary2["selection"]["selected_count"] == 3  # the math tests
-    assert summary2["cache"]["hits"] == 2  # all but the deliberate failure
+    assert summary2["selection"]["selected_count"] == 2  # the math tests
+    assert summary2["cache"]["hits"] == 2
 
 
 def test_flaky_blocked_tests_are_not_served(demo: Path) -> None:
@@ -267,22 +284,21 @@ def test_flaky_blocked_tests_are_not_served(demo: Path) -> None:
     assert rows["tests/test_math.py::test_div"]["cache_hit"] is True
 
 
-def test_environment_mismatch_reexecutes_served_hits(demo: Path) -> None:
-    run_all(demo)  # warms result cache and collection cache with the live env
-    # Tamper the collection-cache entry so it claims another interpreter: hits keyed
-    # under it miss, the run pass reports the live env, the entry is dropped.
-    for entry_path in (demo / ".proof-ci/collect-cache").glob("*.json"):
+def test_environment_mismatch_drops_the_collection_entry(demo: Path) -> None:
+    cli.invoke(app, ["run", "--all", "--json", "--repo", str(demo)])  # warms collection cache
+    # Tamper the collection-cache entry so it claims another interpreter: the run
+    # reports the live env and the entry is dropped.
+    entries = list((demo / ".proof-ci/collect-cache").glob("*.json"))
+    assert entries
+    for entry_path in entries:
         data = json.loads(entry_path.read_text(encoding="utf-8"))
         data["python"] = "0.0.1"
         entry_path.write_text(json.dumps(data), encoding="utf-8")
-    summary = run_all(demo)
-    assert summary["cache"]["hits"] == 0
+    cli.invoke(app, ["run", "--all", "--json", "--repo", str(demo)])
     assert not any(
         json.loads(p.read_text(encoding="utf-8"))["python"] == "0.0.1"
         for p in (demo / ".proof-ci/collect-cache").glob("*.json")
     )
-    # The next run is fully keyed on the live environment again.
-    assert run_all(demo)["cache"]["hits"] == 6
 
 
 def test_stale_entry_rechecks_env_before_serving_all_hits(demo: Path) -> None:

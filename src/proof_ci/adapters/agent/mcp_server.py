@@ -460,21 +460,50 @@ async def serve() -> None:
 
     from proof_ci import __version__
 
-    server: Server[Any, Any] = Server(SERVER_NAME, version=__version__)
+    server: Any
+    if hasattr(Server, "list_tools"):
+        # mcp 1.x: decorator registration.
+        server = Server(SERVER_NAME, version=__version__)
 
-    @server.list_tools()  # type: ignore[no-untyped-call, untyped-decorator]
-    async def _list() -> list[types.Tool]:
-        return tool_definitions()
+        @server.list_tools()  # type: ignore[untyped-decorator, unused-ignore]
+        async def _list() -> list[types.Tool]:
+            return tool_definitions()
 
-    @server.call_tool()  # type: ignore[untyped-decorator]
-    async def _call(name: str, arguments: dict[str, Any]) -> Any:
-        try:
-            # Tests run in a subprocess; keep the server responsive meanwhile.
-            data = await anyio.to_thread.run_sync(call_tool, name, arguments)
-        except ToolError as exc:
-            raise ValueError(str(exc)) from exc
-        text = json.dumps(data, ensure_ascii=False, indent=2)
-        return [types.TextContent(type="text", text=text)], data
+        @server.call_tool()  # type: ignore[untyped-decorator, unused-ignore]
+        async def _call(name: str, arguments: dict[str, Any]) -> Any:
+            try:
+                # Tests run in a subprocess; keep the server responsive meanwhile.
+                data = await anyio.to_thread.run_sync(call_tool, name, arguments)
+            except ToolError as exc:
+                raise ValueError(str(exc)) from exc
+            text = json.dumps(data, ensure_ascii=False, indent=2)
+            return [types.TextContent(type="text", text=text)], data
+
+    else:
+        # mcp 2.x: handlers are constructor arguments and return full result objects.
+        async def _list2(ctx: Any, params: Any) -> Any:
+            return types.ListToolsResult(tools=tool_definitions())
+
+        result_v2: Any = types.CallToolResult  # 2.x field names; typed against installed mcp
+
+        async def _call2(ctx: Any, params: Any) -> Any:
+            try:
+                data = await anyio.to_thread.run_sync(
+                    call_tool, params.name, dict(params.arguments or {})
+                )
+            except ToolError as exc:
+                return result_v2(
+                    content=[types.TextContent(type="text", text=str(exc))], is_error=True
+                )
+            text = json.dumps(data, ensure_ascii=False, indent=2)
+            return result_v2(
+                content=[types.TextContent(type="text", text=text)], structured_content=data
+            )
+
+        server_v2: Any = Server  # 2.x signature; typed against whichever mcp is installed
+        server = server_v2(
+            SERVER_NAME, version=__version__, on_list_tools=_list2, on_call_tool=_call2
+        )
 
     os.environ.setdefault("PYTHONIOENCODING", "utf-8")
     async with stdio_server() as (read, write):

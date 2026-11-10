@@ -416,21 +416,44 @@ def test_likely_cause_end_to_end(demo: Path) -> None:
     assert cause["line"] == 5
 
 
+def _fix_failing_demo_test(repo: Path) -> None:
+    path = repo / "tests/test_math.py"
+    text = path.read_text(encoding="utf-8")
+    fixed = text.replace("def test_div_wrong_expectation", "def _not_a_test_div_wrong_expectation")
+    assert fixed != text
+    path.write_text(fixed, encoding="utf-8")
+    git(repo, "commit", "-q", "-am", "green")
+
+
+def test_failing_full_run_never_suppresses_the_fallback(demo: Path) -> None:
+    git(demo, "checkout", "-q", "-b", "feat")
+    with (demo / "pyproject.toml").open("a", encoding="utf-8") as fh:
+        fh.write("\n# bump\n")
+    git(demo, "commit", "-q", "-am", "bump")
+    _, first, _ = run_json("run", "--json", "--repo", str(demo))
+    assert first["selection"]["fallback_full_run"] is True and first["outcome"] == "failed"
+    edit_mathops(demo)
+    _, second, _ = run_json("run", "--json", "--repo", str(demo))
+    assert second["selection"]["fallback_full_run"] is True
+
+
 def test_run_records_suppressed_fallback(demo: Path) -> None:
+    _fix_failing_demo_test(demo)
     git(demo, "checkout", "-q", "-b", "feat")
     with (demo / "pyproject.toml").open("a", encoding="utf-8") as fh:
         fh.write("\n# bump\n")
     git(demo, "commit", "-q", "-am", "bump")
     _, first, _ = run_json("run", "--json", "--repo", str(demo))
     assert first["selection"]["fallback_full_run"] is True
-    assert first["selection"]["selected_count"] == 7
+    assert first["selection"]["selected_count"] == 6
+    assert first["outcome"] == "passed"
     edit_mathops(demo)
     _, second, _ = run_json("run", "--json", "--repo", str(demo))
     sel = second["selection"]
     assert sel["fallback_full_run"] is False
     assert sel["fallback_suppressed_by_tree"] == first["commit_tree"]
     assert set(sel) >= {"fallback_reason"} and sel["fallback_reason"].startswith("suppressed:")
-    assert sel["selected_count"] == 3
+    assert sel["selected_count"] == 2
 
 
 # ---------------------------------------------------------------- collect cache
@@ -517,3 +540,150 @@ def test_case_insensitive_invocation_uses_committed_case(demo: Path) -> None:
     results = json.loads((demo / summary["results_path"]).read_text(encoding="utf-8"))
     assert [r["test_id"] for r in results] == ["tests/test_math.py::test_add"]
     assert results[0]["location"]["file"] == "tests/test_math.py"
+
+
+# ------------------------------------------------ untraced changes (M13 C1/C3)
+
+
+def _commit_files(repo: Path, files: dict[str, str]) -> None:
+    for rel, text in files.items():
+        path = repo / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "fixtures")
+
+
+def _append(repo: Path, rel: str, text: str) -> None:
+    with (repo / rel).open("a", encoding="utf-8") as fh:
+        fh.write(text)
+
+
+def _affected(repo: Path) -> dict[str, Any]:
+    code, data, _ = run_json("affected", "--json", "--repo", str(repo))
+    assert code == 0, data
+    return data
+
+
+def test_module_no_test_imports_forces_a_full_run(demo: Path) -> None:
+    # Like a pytest plugin loaded through an entry point: no test imports it.
+    _commit_files(demo, {"src/demo/plugin.py": "def pytest_configure(config):\n    pass\n"})
+    _append(demo, "src/demo/plugin.py", "\n# edit\n")
+    data = _affected(demo)
+    assert data["fallback_full_run"] is True
+    assert "src/demo/plugin.py is not imported by any collected test" in data["fallback_reason"]
+    assert len(data["selected_tests"]) == 7
+
+
+def test_module_reached_through_an_untested_script_forces_a_full_run(demo: Path) -> None:
+    # tools/serve.py is launched as a subprocess by a test; it imports demo.textops.
+    _commit_files(demo, {"tools/serve.py": "from demo import textops\nprint(textops)\n"})
+    _append(demo, "src/demo/textops.py", "\n# edit\n")
+    data = _affected(demo)
+    assert data["fallback_full_run"] is True
+    assert "tools/serve.py" in data["fallback_reason"]
+
+
+def test_traced_module_edit_still_selects_narrowly(demo: Path) -> None:
+    _commit_files(demo, {"tools/serve.py": "print('no imports from the package')\n"})
+    edit_mathops(demo)
+    data = _affected(demo)
+    assert data["fallback_full_run"] is False
+    assert set(data["selected_tests"]) == MATH
+
+
+def test_package_data_forces_a_full_run(demo: Path) -> None:
+    _commit_files(demo, {"src/demo/table.json": "{}\n"})
+    (demo / "src/demo/table.json").write_text('{"a": 1}\n', encoding="utf-8")
+    data = _affected(demo)
+    assert data["fallback_full_run"] is True
+    assert "package data" in data["fallback_reason"]
+
+
+def test_data_named_by_non_test_code_forces_a_full_run(demo: Path) -> None:
+    _commit_files(
+        demo,
+        {
+            "tools/settings.json": "{}\n",
+            "tools/load.py": "import json\nCFG = json.load(open('tools/settings.json'))\n",
+        },
+    )
+    (demo / "tools/settings.json").write_text('{"a": 1}\n', encoding="utf-8")
+    data = _affected(demo)
+    assert data["fallback_full_run"] is True
+    assert "named by non-test code tools/load.py" in data["fallback_reason"]
+
+
+def test_root_doc_named_by_a_test_is_selected(demo: Path) -> None:
+    _commit_files(
+        demo,
+        {
+            "tests/test_readme.py": (
+                "from pathlib import Path\n\n\ndef test_readme():\n"
+                "    assert Path('README.md').read_text(encoding='utf-8')\n"
+            )
+        },
+    )
+    _append(demo, "README.md", "\nmore\n")
+    data = _affected(demo)
+    assert data["fallback_full_run"] is False
+    assert data["selected_tests"] == ["tests/test_readme.py::test_readme"]
+
+
+def test_unreferenced_doc_selects_nothing(demo: Path) -> None:
+    _commit_files(demo, {"docs/notes.md": "notes\n"})
+    _append(demo, "docs/notes.md", "\nmore\n")
+    data = _affected(demo)
+    assert data["fallback_full_run"] is False
+    assert data["selected_tests"] == []
+
+
+def test_import_through_sys_path_is_traced(demo: Path) -> None:
+    # A test puts helpers/ on sys.path and imports helpmod by its bare name.
+    _commit_files(
+        demo,
+        {
+            "helpers/helpmod.py": "VALUE = 1\n",
+            "tests/test_helper.py": (
+                "import sys\nfrom pathlib import Path\n\n"
+                "sys.path.insert(0, str(Path(__file__).parents[1] / 'helpers'))\n"
+                "import helpmod  # noqa: E402\n\n\n"
+                "def test_value():\n    assert helpmod.VALUE == 1\n"
+            ),
+        },
+    )
+    _append(demo, "helpers/helpmod.py", "\n# edit\n")
+    data = _affected(demo)
+    assert data["fallback_full_run"] is False
+    assert data["selected_tests"] == ["tests/test_helper.py::test_value"]
+
+
+# ------------------------------------------- collection errors, crashed runs (M13 E2/C6)
+
+
+def test_collection_error_is_a_structured_error_result(demo: Path) -> None:
+    (demo / "tests/test_broken.py").write_text(
+        "import does_not_exist_m13\n\n\ndef test_never():\n    pass\n", encoding="utf-8"
+    )
+    code, summary, _ = run_json("run", "--all", "--json", "--repo", str(demo))
+    assert code == 1
+    assert summary["outcome"] == "failed"  # the deliberate failure; the error counts too
+    assert summary["counts"]["error"] == 1
+    assert summary["counts"]["passed"] == 6
+    broken = next(f for f in summary["failures"] if f["test_id"] == "tests/test_broken.py")
+    assert broken["error_type"] in ("ModuleNotFoundError", "ImportError")
+    assert "does_not_exist_m13" in broken["error_message"]
+    # --failed reruns the file once it collects again.
+    (demo / "tests/test_broken.py").write_text("def test_now():\n    pass\n", encoding="utf-8")
+    code, again, err = run_json("run", "--failed", "--json", "--repo", str(demo))
+    assert again, err
+    ids = {r["test_id"] for r in json.loads((demo / again["results_path"]).read_text("utf-8"))}
+    assert "tests/test_broken.py::test_now" in ids
+
+
+def test_failed_refuses_after_an_unfinished_run(demo: Path) -> None:
+    run_json("run", "--all", "--json", "--repo", str(demo))
+    (demo / ".proof-ci" / "run-in-progress").write_text("x\n", encoding="utf-8")
+    code, _, out = run_json("run", "--failed", "--json", "--repo", str(demo))
+    assert code == 2
+    assert "did not finish" in out
