@@ -551,7 +551,7 @@ def loaded_conftests(graph: ImportGraph, test_files: Iterable[str]) -> set[str]:
 
 
 # Files whose text can register a module as a pytest plugin or name it on the command line.
-_CONFIG_FILES = ("pyproject.toml", "setup.cfg", "pytest.ini", "tox.ini", "proof-ci.toml")
+_INI_FILES = ("setup.cfg", "pytest.ini", "tox.ini")
 # Directory names too generic to count as naming the files below them.
 _GENERIC_DIRS = frozenset({"src", "lib", "test", "tests", "testing"})
 
@@ -599,9 +599,96 @@ def _name_patterns(graph: ImportGraph, path: str) -> list[re.Pattern[str]]:
     return [re.compile(x) for x in pats]
 
 
-def _plugin_like(graph: ImportGraph, path: str, config_text: str) -> bool:
-    names = [n for n in graph._module_names(path) if "." in n or n == PurePosixPath(path).stem]
-    return any(re.search(rf"(?<![\w.]){re.escape(n)}(?![\w])", config_text) for n in names)
+def _dash_p(args: Iterable[str]) -> set[str]:
+    """Module names given to pytest as ``-p NAME`` or ``-pNAME`` (``no:`` disables)."""
+    out: set[str] = set()
+    items = list(args)
+    for i, arg in enumerate(items):
+        name = items[i + 1] if arg == "-p" and i + 1 < len(items) else ""
+        if arg.startswith("-p") and arg != "-p":
+            name = arg[2:]
+        if name and not name.startswith("no:"):
+            out.add(name)
+    return out
+
+
+def _split_opts(value: object) -> list[str]:
+    if isinstance(value, str):
+        return value.split()
+    if isinstance(value, list):
+        return [str(v) for v in value]
+    return []
+
+
+def plugin_modules(repo: Path) -> set[str]:
+    """Modules pytest loads as plugins because the repository says so: ``pytest11``
+    entry points and ``-p`` in pytest options (pyproject, setup.cfg, pytest.ini,
+    tox.ini, proof-ci.toml). Other mentions of a module in config (lint or type-checker
+    settings) do not make it a plugin."""
+    import configparser
+    import tomllib
+
+    names: set[str] = set()
+
+    def entry(value: object) -> None:
+        if isinstance(value, str) and value.strip():
+            names.add(value.split(":", 1)[0].strip())
+
+    def load_toml(name: str) -> dict[str, object]:
+        try:
+            data = tomllib.loads((repo / name).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    pyproject = load_toml("pyproject.toml")
+    project = pyproject.get("project")
+    if isinstance(project, dict):
+        eps = project.get("entry-points")
+        if isinstance(eps, dict) and isinstance(eps.get("pytest11"), dict):
+            for v in eps["pytest11"].values():
+                entry(v)
+    tool = pyproject.get("tool")
+    if isinstance(tool, dict):
+        pt = tool.get("pytest")
+        if isinstance(pt, dict):
+            for section in (pt, pt.get("ini_options")):
+                if isinstance(section, dict):
+                    names |= _dash_p(_split_opts(section.get("addopts")))
+        poetry = tool.get("poetry")
+        if isinstance(poetry, dict):
+            plugins = poetry.get("plugins")
+            if isinstance(plugins, dict) and isinstance(plugins.get("pytest11"), dict):
+                for v in plugins["pytest11"].values():
+                    entry(v)
+    ours = load_toml("proof-ci.toml").get("project")
+    if isinstance(ours, dict):
+        names |= _dash_p(_split_opts(ours.get("pytest_args")))
+    for ini in _INI_FILES:
+        parser = configparser.ConfigParser(interpolation=None)
+        try:
+            parser.read_string((repo / ini).read_text(encoding="utf-8"))
+        except (OSError, configparser.Error):
+            continue
+        for section in ("pytest", "tool:pytest"):
+            if parser.has_option(section, "addopts"):
+                names |= _dash_p(parser.get(section, "addopts").split())
+        if parser.has_option("options.entry_points", "pytest11"):
+            for line in parser.get("options.entry_points", "pytest11").splitlines():
+                if "=" in line:
+                    entry(line.split("=", 1)[1])
+    return names
+
+
+def _plugin_like(graph: ImportGraph, path: str, plugins: set[str]) -> bool:
+    return any(n in plugins for n in graph._module_names(path))
+
+
+def _names_it(text: str, pats: list[re.Pattern[str]]) -> bool:
+    # A collect_ignore entry names a file precisely so pytest does NOT run it.
+    return any(
+        pt.search(line) for line in text.splitlines() if "collect_ignore" not in line for pt in pats
+    )
 
 
 def _tests_reaching(graph: ImportGraph, files: Iterable[str], tests: set[str]) -> set[str]:
@@ -649,11 +736,7 @@ def untraced_changes(
     reached = graph.reached_from(roots)
     orphans = {f for f in graph.files if f not in reached}
     src = [r.strip("/") for r in source_roots if r.strip("/")]
-    config_text = "\n".join(
-        (graph.repo / name).read_text(encoding="utf-8", errors="replace")
-        for name in _CONFIG_FILES
-        if (graph.repo / name).is_file()
-    )
+    plugins = plugin_modules(graph.repo)
     triggers: list[tuple[str, str]] = []
     extra: set[str] = set()
     for path in changed:
@@ -663,16 +746,12 @@ def untraced_changes(
             reason: str | None = None
             for orphan in sorted(graph._dependents([path]) & orphans):
                 via = "" if orphan == path else f" (imported by {orphan})"
-                if _plugin_like(graph, orphan, config_text):
-                    reason = (
-                        f"{path}{via} is named in pytest/project config (it may load as a plugin)"
-                    )
+                if _plugin_like(graph, orphan, plugins):
+                    reason = f"{path}{via} is registered as a pytest plugin"
                     break
                 pats = _name_patterns(graph, orphan)
                 launchers = {
-                    f
-                    for f in reached
-                    if f != orphan and any(pt.search(graph.texts.get(f, "")) for pt in pats)
+                    f for f in reached if f != orphan and _names_it(graph.texts.get(f, ""), pats)
                 }
                 top = graph._top_package(orphan)
                 launchers |= {d for d in graph.dynamic & reached if graph._top_package(d) == top}

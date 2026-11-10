@@ -247,7 +247,7 @@ def test_subprocess_args_and_env(
     assert "PROOF_CI_COLLECT_FILE" in collect["env"]
     assert "PROOF_CI_RESULTS_FILE" not in collect["env"]
     assert run["argv"][:2] == ["-p", "proof_ci.pytest_plugin"]
-    assert run["argv"][-1] == "tests/test_math.py::test_add"
+    assert run["argv"][-1] == "tests"  # every collected test: the paths, not node ids
     assert "PROOF_CI_RESULTS_FILE" in run["env"]
     assert "PROOF_CI_COLLECT_FILE" not in run["env"]
 

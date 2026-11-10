@@ -678,7 +678,7 @@ def test_module_named_in_pytest_config_forces_a_full_run(demo: Path) -> None:
     _append(demo, "src/demo/plug.py", "\n# edit\n")
     data = _affected(demo)
     assert data["fallback_full_run"] is True
-    assert "named in pytest/project config" in data["fallback_reason"]
+    assert "registered as a pytest plugin" in data["fallback_reason"]
 
 
 def test_main_module_run_with_dash_m_selects_its_launcher(demo: Path) -> None:
@@ -812,3 +812,43 @@ def test_failed_refuses_after_an_unfinished_run(demo: Path) -> None:
     code, _, out = run_json("run", "--failed", "--json", "--repo", str(demo))
     assert code == 2
     assert "did not finish" in out
+
+
+def test_module_named_by_lint_config_or_collect_ignore_is_not_a_plugin(demo: Path) -> None:
+    # attrs: a test file excluded via collect_ignore and named in ruff's per-file config
+    # imports the edited module. Neither mention runs it, so selection stays narrow.
+    _commit_files(
+        demo,
+        {
+            "tests/test_skipme.py": "from demo import textops\n\n\ndef test_x():\n    pass\n",
+            "tests/conftest.py": 'collect_ignore = ["test_skipme.py"]\n',
+        },
+    )
+    _append(
+        demo,
+        "pyproject.toml",
+        '\n[tool.ruff.lint.per-file-ignores]\n"tests/test_skipme.py" = ["E1"]\n',
+    )
+    git(demo, "commit", "-q", "-am", "config")
+    _append(demo, "src/demo/textops.py", "\n# edit\n")
+    data = _affected(demo)
+    assert data["fallback_full_run"] is False
+    assert set(data["selected_tests"]) == TEXT
+
+
+def test_dash_p_in_addopts_registers_a_plugin(demo: Path) -> None:
+    _commit_files(demo, {"src/demo/plug.py": "def pytest_configure(config):\n    pass\n"})
+    pp = demo / "pyproject.toml"
+    text = pp.read_text(encoding="utf-8")
+    assert 'testpaths = ["tests"]\n' in text
+    pp.write_text(
+        text.replace(
+            'testpaths = ["tests"]\n', 'testpaths = ["tests"]\naddopts = "-p demo.plug"\n'
+        ),
+        encoding="utf-8",
+    )
+    git(demo, "commit", "-q", "-am", "register plugin")
+    _append(demo, "src/demo/plug.py", "\n# edit\n")
+    data = _affected(demo)
+    assert data["fallback_full_run"] is True
+    assert "registered as a pytest plugin" in data["fallback_reason"]

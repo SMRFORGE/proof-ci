@@ -5,8 +5,10 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
+from contextlib import closing
 from pathlib import Path
 from typing import Any
 
@@ -176,10 +178,7 @@ def test_second_run_hits_and_failures_are_never_cached(demo: Path) -> None:
     assert rows["tests/test_math.py::test_add"]["cache_hit"] is True
     assert rows[FAILING]["cache_hit"] is False  # failures always re-execute
     assert second["counts"]["passed"] == 6 and second["counts"]["failed"] == 1
-    stored = [
-        json.loads(p.read_text(encoding="utf-8"))
-        for p in (demo / ".proof-ci/cache").rglob("*.json")
-    ]
+    stored = _stored(demo)
     assert len(stored) == 6
     assert all(s["outcome"] not in ("failed", "error") for s in stored)
 
@@ -211,9 +210,7 @@ def test_cache_disabled_in_config(demo: Path) -> None:
         fh.write("\n[cache]\nenabled = false\n")
     run_all(demo)
     assert run_all(demo)["cache"]["hits"] == 0
-    assert not (demo / ".proof-ci/cache").exists() or not any(
-        (demo / ".proof-ci/cache").rglob("*.json")
-    )
+    assert _stored(demo) == []
 
 
 def test_edit_invalidates_only_dependent_tests(demo: Path) -> None:
@@ -318,51 +315,106 @@ def test_stale_entry_rechecks_env_before_serving_all_hits(demo: Path) -> None:
 # --------------------------------------------------------------------- LRU trim
 
 
+def _stored(repo: Path) -> list[dict[str, Any]]:
+    db = repo / ".proof-ci/cache" / ResultCache.FILE
+    if not db.exists():
+        return []
+    with closing(sqlite3.connect(db)) as conn:
+        return [json.loads(r[0]) for r in conn.execute("SELECT data FROM results")]
+
+
+VALID = {
+    "schema_version": "1.0.0",
+    "test_id": "tests/t.py::t",
+    "outcome": "passed",
+    "duration_ms": 1,
+    "location": {"file": "tests/t.py", "line": 1},
+    "cache_hit": False,
+}
+
+
+def _set_used(directory: Path, key: str, used: float) -> None:
+    with closing(sqlite3.connect(directory / ResultCache.FILE)) as conn, conn:
+        conn.execute("UPDATE results SET used = ? WHERE key = ?", (used, key))
+
+
 def test_lru_trim_across_result_and_collect_caches(tmp_path: Path) -> None:
     results = tmp_path / "cache"
     collect = tmp_path / "collect-cache"
-    files = []
+    rc = ResultCache(results)
+    payload = {**VALID, "test_id": "tests/t.py::" + "x" * 60}
+    size = len(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+    order: list[tuple[str, str]] = []
     for i in range(6):
-        d = results if i % 2 else collect
-        p = d / f"{i:02d}" / f"{i:064d}.json"
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text("x" * 100, encoding="utf-8")
-        os.utime(p, (1000 + i, 1000 + i))
-        files.append(p)
-    assert trim_caches([results, collect], high=1000, low=500) == 0
-    deleted = trim_caches([results, collect], high=500, low=300)
-    assert deleted == 3
-    assert [p.exists() for p in files] == [False, False, False, True, True, True]
+        if i % 2:
+            key = f"{i:064d}"
+            rc.put(key, payload)
+            _set_used(results, key, 1000 + i)
+            order.append(("row", key))
+        else:
+            p = collect / f"{i:064d}.json"
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text("x" * size, encoding="utf-8")
+            os.utime(p, (1000 + i, 1000 + i))
+            order.append(("file", str(p)))
+    assert trim_caches([results, collect], high=size * 7, low=size * 4) == 0
+    assert trim_caches([results, collect], high=size * 5, low=size * 3) == 3
+    alive = [
+        (rc.get(ref) is not None) if kind == "row" else Path(ref).exists() for kind, ref in order
+    ]
+    assert alive == [False, False, False, True, True, True]
 
 
-def test_hit_updates_mtime(tmp_path: Path) -> None:
+def test_hit_updates_last_use(tmp_path: Path) -> None:
     rc = ResultCache(tmp_path)
     key = "cd" * 32
-    valid = {
-        "schema_version": "1.0.0",
-        "test_id": "tests/t.py::t",
-        "outcome": "passed",
-        "duration_ms": 1,
-        "location": {"file": "tests/t.py", "line": 1},
-        "cache_hit": False,
-    }
-    rc.put(key, valid)
-    path = tmp_path / key[:2] / f"{key}.json"
-    os.utime(path, (1000, 1000))
+    rc.put(key, VALID)
+    _set_used(tmp_path, key, 1000)
     assert rc.get(key) is not None
-    assert path.stat().st_mtime > 1000
+    with closing(sqlite3.connect(tmp_path / ResultCache.FILE)) as conn:
+        (used,) = conn.execute("SELECT used FROM results WHERE key = ?", (key,)).fetchone()
+    assert used > 1000
 
 
 def test_corrupt_or_failed_entries_are_misses(tmp_path: Path) -> None:
     rc = ResultCache(tmp_path)
     key = "ef" * 32
-    path = tmp_path / key[:2] / f"{key}.json"
-    path.parent.mkdir(parents=True)
+    rc.put(key, VALID)
     for content in (
         "not json",
         "[]",
         '{"outcome": "passed"}',
         json.dumps({"outcome": "failed", "test_id": "t"}),
     ):
-        path.write_text(content, encoding="utf-8")
+        with closing(sqlite3.connect(tmp_path / ResultCache.FILE)) as conn, conn:
+            conn.execute("UPDATE results SET data = ? WHERE key = ?", (content, key))
         assert rc.get(key) is None
+
+
+def test_one_run_writes_the_cache_in_one_file(demo: Path) -> None:
+    run_all(demo)
+    files = {p.name for p in (demo / ".proof-ci/cache").rglob("*") if p.is_file()}
+    assert files <= {"results.sqlite", "results.sqlite-wal", "results.sqlite-shm"}
+    assert len(_stored(demo)) == 6
+
+
+def test_full_run_passes_paths_not_node_ids(demo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from proof_ci.adapters.runners.pytest_runner import PytestRunner
+
+    seen: list[list[str]] = []
+    real = PytestRunner.run
+
+    def spy(self: PytestRunner, test_ids: list[str], extra_args: tuple[str, ...] = ()) -> Any:
+        seen.append(list(test_ids))
+        return real(self, test_ids, extra_args)
+
+    monkeypatch.setattr(PytestRunner, "run", spy)
+    result = cli.invoke(app, ["run", "--all", "--json", "--repo", str(demo)])
+    data = json.loads(result.stdout)
+    assert data["counts"]["passed"] == 6 and data["counts"]["failed"] == 1
+    assert seen and not any("::" in a for a in seen[-1])
+    seen.clear()
+    cli.invoke(
+        app, ["run", "tests/test_math.py::test_add", "--no-cache", "--json", "--repo", str(demo)]
+    )
+    assert seen == [["tests/test_math.py::test_add"]]

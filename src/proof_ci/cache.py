@@ -8,8 +8,11 @@ import configparser
 import hashlib
 import json
 import os
+import sqlite3
 import time
 import tomllib
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -292,57 +295,122 @@ def result_cache_key(
 
 
 class ResultCache:
-    """``<dir>/<key[:2]>/<key>.json`` holding one serialised TestResult."""
+    """Passing, skipped and xfail results in one SQLite file, ``<dir>/results.sqlite``.
+
+    One file, written in one transaction per run: a run that stores thousands of
+    results costs one commit, not thousands of file creations (M13: one file per test
+    took seconds on Windows). Connections are per operation with WAL (Section 5.20
+    rule 8) so a concurrent CLI and MCP server do not block each other.
+    """
+
+    FILE = "results.sqlite"
 
     def __init__(self, directory: Path) -> None:
         self.directory = directory
+        self.path = directory / self.FILE
 
-    def _path(self, key: str) -> Path:
-        return self.directory / key[:2] / f"{key}.json"
-
-    def get(self, key: str) -> dict[str, Any] | None:
-        path = self._path(key)
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
+        self.directory.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(self.path, timeout=5.0)
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
+            conn.execute("PRAGMA busy_timeout = 5000")
+            mode = conn.execute("PRAGMA journal_mode = WAL").fetchone()
+            if not mode or str(mode[0]).lower() != "wal":
+                conn.execute("PRAGMA journal_mode = DELETE")
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS results (key TEXT PRIMARY KEY, data TEXT NOT NULL, "
+                "size INTEGER NOT NULL, used REAL NOT NULL)"
+            )
+            yield conn
+            conn.commit()
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _valid(raw: str) -> dict[str, Any] | None:
+        try:
+            data = json.loads(raw)
+        except ValueError:
             return None
         if not isinstance(data, dict) or data.get("outcome") not in CACHEABLE_OUTCOMES:
-            return None  # never replay a failure, whatever is on disk
+            return None  # never replay a failure, whatever is stored
         try:
             from proof_ci.models import TestResult
 
             TestResult.model_validate(data)
         except ValueError:
             return None  # corrupt or hand-edited entry: treat as a miss
-        try:
-            os.utime(path)  # LRU: a hit counts as a use
-        except OSError:
-            pass
         return data
 
+    def get_many(self, keys: Iterable[str]) -> dict[str, dict[str, Any]]:
+        wanted = list(dict.fromkeys(keys))
+        if not wanted or not self.path.exists():
+            return {}
+        found: dict[str, dict[str, Any]] = {}
+        try:
+            with self._connect() as conn:
+                for i in range(0, len(wanted), 500):
+                    chunk = wanted[i : i + 500]
+                    marks = ",".join("?" for _ in chunk)
+                    rows = conn.execute(
+                        f"SELECT key, data FROM results WHERE key IN ({marks})", chunk
+                    ).fetchall()
+                    for key, raw in rows:
+                        data = self._valid(raw)
+                        if data is not None:
+                            found[key] = data
+                if found:  # LRU: a hit counts as a use
+                    now = time.time()
+                    conn.executemany(
+                        "UPDATE results SET used = ? WHERE key = ?", [(now, k) for k in found]
+                    )
+        except sqlite3.Error:
+            return {}
+        return found
+
+    def get(self, key: str) -> dict[str, Any] | None:
+        return self.get_many([key]).get(key)
+
+    def put_many(self, entries: Iterable[tuple[str, dict[str, Any]]]) -> None:
+        rows = []
+        now = time.time()
+        for key, result in entries:
+            if result.get("outcome") not in CACHEABLE_OUTCOMES:
+                raise ValueError(f"outcome {result.get('outcome')!r} must never be cached")
+            raw = json.dumps(result, ensure_ascii=False)
+            rows.append((key, raw, len(raw.encode("utf-8")), now))
+        if not rows:
+            return
+        with self._connect() as conn:
+            conn.executemany(
+                "INSERT OR REPLACE INTO results (key, data, size, used) VALUES (?, ?, ?, ?)", rows
+            )
+
     def put(self, key: str, result: dict[str, Any]) -> None:
-        if result.get("outcome") not in CACHEABLE_OUTCOMES:
-            raise ValueError(f"outcome {result.get('outcome')!r} must never be cached")
-        path = self._path(key)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_name(path.name + ".tmp")
-        with tmp.open("w", encoding="utf-8", newline="\n") as fh:
-            json.dump(result, fh, ensure_ascii=False)
-            fh.write("\n")
-        os.replace(tmp, path)
+        self.put_many([(key, result)])
 
 
 def trim_caches(directories: list[Path], high: int | None = None, low: int | None = None) -> int:
     """Delete least-recently-used entries across ``directories`` once over ``high`` bytes.
 
-    Returns the number of files deleted.
+    Entries are collection-cache JSON files and rows of any ``results.sqlite`` found in
+    the directories. Returns the number of entries deleted.
     """
     high = TRIM_HIGH_BYTES if high is None else high
     low = TRIM_LOW_BYTES if low is None else low
-    entries: list[tuple[float, int, Path]] = []
+    entries: list[tuple[float, int, Path, str]] = []
     for d in directories:
         if not d.is_dir():
             continue
+        db = d / ResultCache.FILE
+        if db.is_file():
+            try:
+                with ResultCache(d)._connect() as conn:
+                    for key, size, used in conn.execute("SELECT key, size, used FROM results"):
+                        entries.append((float(used), int(size), db, str(key)))
+            except sqlite3.Error:
+                pass
         for dirpath, _dirs, files in os.walk(d):
             for name in files:
                 if not name.endswith(".json"):
@@ -352,18 +420,28 @@ def trim_caches(directories: list[Path], high: int | None = None, low: int | Non
                     st = path.stat()
                 except OSError:
                     continue
-                entries.append((st.st_mtime, st.st_size, path))
-    total = sum(size for _, size, _ in entries)
+                entries.append((st.st_mtime, st.st_size, path, ""))
+    total = sum(size for _, size, _, _ in entries)
     if total <= high:
         return 0
+    doomed_rows: dict[Path, list[str]] = {}
     deleted = 0
-    for _mtime, size, path in sorted(entries):
+    for _used, size, entry_path, key in sorted(entries, key=lambda e: e[0]):
         if total <= low:
             break
-        try:
-            path.unlink()
-        except OSError:
-            continue
+        if key:
+            doomed_rows.setdefault(entry_path, []).append(key)
+        else:
+            try:
+                entry_path.unlink()
+            except OSError:
+                continue
         total -= size
         deleted += 1
+    for db, keys in doomed_rows.items():
+        try:
+            with ResultCache(db.parent)._connect() as conn:
+                conn.executemany("DELETE FROM results WHERE key = ?", [(k,) for k in keys])
+        except sqlite3.Error:
+            deleted -= len(keys)
     return deleted

@@ -402,7 +402,8 @@ def test_long_selection_goes_through_an_argfile(
     from proof_ci.adapters.runners import pytest_runner
 
     monkeypatch.setattr(pytest_runner, "ARGFILE_THRESHOLD", 0)
-    _, summary, err = run(demo, "--all")
+    # Explicit paths select by node id (a full --all run passes the test paths instead).
+    _, summary, err = run(demo, "tests")
     assert summary, err
     assert summary["counts"]["passed"] == 6 and summary["counts"]["failed"] == 1
     run_dir = demo / Path(summary["results_path"]).parent

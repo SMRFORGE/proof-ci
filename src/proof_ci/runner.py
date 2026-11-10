@@ -772,12 +772,16 @@ def execute_run(cfg: Config, options: RunOptions) -> RunOutcome:
         found: dict[str, TestResult] = {}
         if keys is None or not read_cache:
             return found
+        wanted: dict[str, str] = {}
         for test_id in plan.selected:
             if flakes_before.blocks_cache(test_id):
                 continue
             if plan.item_file[test_id] in plan.no_cache_files:
                 continue  # selected for a reason its cache key does not capture
-            stored = result_cache.get(keys.key(test_id, plan.item_file[test_id], current))
+            wanted[test_id] = keys.key(test_id, plan.item_file[test_id], current)
+        stored_by_key = result_cache.get_many(wanted.values())
+        for test_id, key in wanted.items():
+            stored = stored_by_key.get(key)
             if stored is not None and stored.get("test_id") == test_id:
                 found[test_id] = TestResult.model_validate({**stored, "cache_hit": True})
         return found
@@ -791,7 +795,18 @@ def execute_run(cfg: Config, options: RunOptions) -> RunOutcome:
     def execute(ids: list[str], retry: bool = True) -> RunOutput:
         nonlocal pytest_ms
         started_pytest = time.monotonic()
-        out = runner.run([plan.invoke_id[t] for t in ids], extra)
+        # Running every collected test: hand pytest the collection paths, not thousands
+        # of node ids (pytest matches each id against its file's items, which costs more
+        # than the tests on large suites). Same paths and args as the collect pass, so the
+        # same tests run; _check_run still verifies every id came back.
+        whole = (
+            plan.mode != "explicit"
+            and not collect_errors
+            and len(ids) == len(plan.collected_ids)
+            and set(ids) == set(plan.collected_ids)
+        )
+        args = list(cfg.project.test_paths) if whole else [plan.invoke_id[t] for t in ids]
+        out = runner.run(args, extra)
         pytest_ms += round((time.monotonic() - started_pytest) * 1000)
         if out.returncode == 2 and out.errors:
             # A selected file no longer collects (pytest then runs nothing at all): report
@@ -909,10 +924,11 @@ def execute_run(cfg: Config, options: RunOptions) -> RunOutcome:
     if cache_on and keys is not None:
         # Replayed hits are never re-written and never enter flake history
         # (Section 5.9): only fresh executions feed both.
-        for test_id, result in executed.items():
-            if result.outcome in CACHEABLE_OUTCOMES and not flakes_after.blocks_cache(test_id):
-                key = keys.key(test_id, plan.item_file[test_id], env)
-                result_cache.put(key, result.to_json())
+        result_cache.put_many(
+            (keys.key(test_id, plan.item_file[test_id], env), result.to_json())
+            for test_id, result in executed.items()
+            if result.outcome in CACHEABLE_OUTCOMES and not flakes_after.blocks_cache(test_id)
+        )
         trim_caches([result_cache.directory, cfg.resolve(cfg.cache.collect_cache_dir)])
 
     duration_ms = round((time.monotonic() - t0) * 1000)
