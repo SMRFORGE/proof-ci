@@ -299,6 +299,8 @@ def test_unwritable_config_dir_is_tolerated(repo: Path, tmp_path: Path) -> None:
 def test_root_owner_warning(repo: Path, monkeypatch: pytest.MonkeyPatch, key_dir: Path) -> None:
     monkeypatch.setattr(os, "geteuid", lambda: 0, raising=False)
     real_stat = Path.stat
+    # Resolve before patching: on Python 3.11/3.12 Path.resolve() calls stat() itself.
+    target = repo.resolve()
 
     class FakeStat:
         def __init__(self, st: os.stat_result) -> None:
@@ -310,7 +312,7 @@ def test_root_owner_warning(repo: Path, monkeypatch: pytest.MonkeyPatch, key_dir
 
     def fake_stat(self: Path, *a: object, **k: object) -> object:
         st = real_stat(self, *a, **k)  # type: ignore[arg-type]
-        return FakeStat(st) if self == repo.resolve() else st
+        return FakeStat(st) if self == target else st
 
     monkeypatch.setattr(Path, "stat", fake_stat)
     result = init_repo(repo)

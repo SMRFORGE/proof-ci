@@ -306,7 +306,13 @@ def plan_selection(
             hunks = changed_hunks(cfg.repo_root, base.base_ref, changed)
 
     use_cache = cfg.cache.enabled and not options.no_cache and options.mode != "explicit"
-    paths = list(options.tests) if options.mode == "explicit" else list(cfg.project.test_paths)
+    # Explicit arguments are mapped to git's committed spelling first: pytest matches node
+    # ids case-sensitively even on case-insensitive filesystems (macOS APFS).
+    paths = (
+        [case.canonical_node_id(t) for t in options.tests]
+        if options.mode == "explicit"
+        else list(cfg.project.test_paths)
+    )
     items, entry, env = _collect(cfg, runner, paths, use_cache)
     collected_ids = [case.canonical_node_id(i["test_id"]) for i in items]
     invoke_id = {case.canonical_node_id(i["test_id"]): i["test_id"] for i in items}
