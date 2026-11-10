@@ -20,11 +20,18 @@ import rfc8785
 from proof_ci.affected import IGNORED_DIRS, is_test_file
 
 __all__ = [
+    "CACHEABLE_OUTCOMES",
     "CollectCache",
     "CollectEntry",
+    "ResultCache",
     "collect_cache_key",
+    "conftest_chain",
+    "deps_hash",
     "file_sha256",
+    "list_repo_files",
     "pytest_config_file",
+    "result_cache_key",
+    "trim_caches",
 ]
 
 
@@ -47,6 +54,23 @@ def _walk(repo: Path, start: Path, want: Any) -> list[str]:
             if want(rel):
                 found.append(rel)
     return sorted(found)
+
+
+def list_repo_files(repo: Path) -> list[str]:
+    """Tracked and untracked (non-ignored) files, repo-relative; falls back to a walk."""
+    try:
+        from proof_ci.util import GitError, run_git
+
+        proc = run_git(repo, "ls-files", "-z", "-co", "--exclude-standard", check=False)
+        if proc.returncode == 0:
+            return sorted(
+                p
+                for p in proc.stdout.split("\0")
+                if p and not any(part in IGNORED_DIRS for part in p.split("/")[:-1])
+            )
+    except GitError:
+        pass
+    return _walk(repo, repo, lambda _rel: True)
 
 
 def pytest_config_file(repo: Path) -> Path | None:
@@ -159,3 +183,129 @@ class CollectCache:
 
     def delete(self, key: str) -> None:
         self._path(key).unlink(missing_ok=True)
+
+
+# --------------------------------------------------------------- result cache (M6)
+
+CACHEABLE_OUTCOMES = frozenset({"passed", "skipped", "xfailed", "xpassed"})
+LOCKFILES = ("uv.lock", "poetry.lock", "pdm.lock", "Pipfile.lock", "requirements.txt")
+
+# LRU thresholds for the combined result + collection caches (spec Section 5.9).
+TRIM_HIGH_BYTES = 500 * 1024 * 1024
+TRIM_LOW_BYTES = 400 * 1024 * 1024
+
+
+def deps_hash(repo: Path, installed: list[str]) -> str:
+    """SHA-256 of existing lockfiles (path-prefixed) then the installed-distribution list."""
+    h = hashlib.sha256()
+    for name in LOCKFILES:
+        path = repo / name
+        if path.is_file():
+            h.update(name.encode("utf-8") + b"\n")
+            h.update(path.read_bytes())
+    h.update(b"installed\n")
+    for line in sorted(installed):
+        h.update(line.encode("utf-8") + b"\n")
+    return h.hexdigest()
+
+
+def conftest_chain(repo: Path, test_file: str) -> list[str]:
+    """Every conftest.py from the test file's directory up to the repo root, inclusive."""
+    found: list[str] = []
+    parts = test_file.split("/")[:-1]
+    for i in range(len(parts), -1, -1):
+        rel = "/".join([*parts[:i], "conftest.py"])
+        if (repo / rel).is_file():
+            found.append(rel)
+    return found
+
+
+def result_cache_key(
+    test_id: str,
+    input_hashes: dict[str, str],
+    pytest_args: tuple[str, ...],
+    python: str,
+    platform: str,
+    deps: str,
+) -> str:
+    material: dict[str, Any] = {
+        "test_id": test_id,
+        "input_hashes": dict(sorted(input_hashes.items())),
+        "pytest_args": list(pytest_args),
+        "python": python,
+        "platform": platform,
+        "deps_hash": deps,
+    }
+    return hashlib.sha256(rfc8785.dumps(material)).hexdigest()
+
+
+class ResultCache:
+    """``<dir>/<key[:2]>/<key>.json`` holding one serialised TestResult."""
+
+    def __init__(self, directory: Path) -> None:
+        self.directory = directory
+
+    def _path(self, key: str) -> Path:
+        return self.directory / key[:2] / f"{key}.json"
+
+    def get(self, key: str) -> dict[str, Any] | None:
+        path = self._path(key)
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        if not isinstance(data, dict):
+            return None
+        try:
+            os.utime(path)  # LRU: a hit counts as a use
+        except OSError:
+            pass
+        return data
+
+    def put(self, key: str, result: dict[str, Any]) -> None:
+        if result.get("outcome") not in CACHEABLE_OUTCOMES:
+            raise ValueError(f"outcome {result.get('outcome')!r} must never be cached")
+        path = self._path(key)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        with tmp.open("w", encoding="utf-8", newline="\n") as fh:
+            json.dump(result, fh, ensure_ascii=False)
+            fh.write("\n")
+        os.replace(tmp, path)
+
+
+def trim_caches(directories: list[Path], high: int | None = None, low: int | None = None) -> int:
+    """Delete least-recently-used entries across ``directories`` once over ``high`` bytes.
+
+    Returns the number of files deleted.
+    """
+    high = TRIM_HIGH_BYTES if high is None else high
+    low = TRIM_LOW_BYTES if low is None else low
+    entries: list[tuple[float, int, Path]] = []
+    for d in directories:
+        if not d.is_dir():
+            continue
+        for dirpath, _dirs, files in os.walk(d):
+            for name in files:
+                if not name.endswith(".json"):
+                    continue
+                path = Path(dirpath, name)
+                try:
+                    st = path.stat()
+                except OSError:
+                    continue
+                entries.append((st.st_mtime, st.st_size, path))
+    total = sum(size for _, size, _ in entries)
+    if total <= high:
+        return 0
+    deleted = 0
+    for _mtime, size, path in sorted(entries):
+        if total <= low:
+            break
+        try:
+            path.unlink()
+        except OSError:
+            continue
+        total -= size
+        deleted += 1
+    return deleted

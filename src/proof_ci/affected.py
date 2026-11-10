@@ -402,6 +402,19 @@ class ImportGraph:
             return f"{root}/{rel.parts[0]}" if rel.parts else root
         return p.parts[0] if p.parts else ""
 
+    def closure(self, path: str) -> set[str]:
+        """Every repository file ``path`` imports, directly or transitively."""
+        seen: set[str] = set()
+        queue = deque(self.deps.get(path, ()))
+        while queue:
+            f = queue.popleft()
+            if f in seen:
+                continue
+            seen.add(f)
+            queue.extend(self.deps.get(f, ()))
+        seen.discard(path)
+        return seen
+
     def affected_files(self, changed: Iterable[str]) -> set[str]:
         """Changed files plus every transitive dependent, with dynamic-import conservatism."""
         seeds = {c for c in changed if c.endswith(".py")}
