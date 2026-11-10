@@ -44,6 +44,7 @@ from proof_ci.cache import (
     trim_caches,
 )
 from proof_ci.config import Config, ConfigError
+from proof_ci.flakes import FlakeSnapshot, FlakeStore, code_hash
 from proof_ci.models import (
     CacheStats,
     Counts,
@@ -80,6 +81,7 @@ class RunOptions:
     json_output: bool = False
     base: str | None = None
     no_cache: bool = False
+    allow_known_flakes: bool = False
 
 
 @dataclass(frozen=True)
@@ -145,7 +147,12 @@ def _counts(results: list[TestResult]) -> Counts:
     tally = {k: 0 for k in ("passed", "failed", "skipped", "error", "xfailed", "xpassed")}
     for r in results:
         tally[r.outcome] += 1
-    return Counts(**tally, flaky_failures=0, total_selected=len(results))
+    flaky = sum(
+        1
+        for r in results
+        if r.outcome in ("failed", "error") and r.flaky is not None and r.flaky.is_flaky
+    )
+    return Counts(**tally, flaky_failures=flaky, total_selected=len(results))
 
 
 def _summary_text(counts: Counts, duration_ms: int, selected: int) -> str:
@@ -376,12 +383,18 @@ def compute_affected(cfg: Config, base: str | None) -> SelectionPlan:
         raise RunError(str(exc)) from exc
 
 
-def cache_blocked_by_flakes(cfg: Config, test_id: str) -> bool:
-    """True when the flake store marks ``test_id`` suspected/confirmed (never cached).
+def cache_blocked_by_flakes(cfg: Config, test_id: str, snapshot: FlakeSnapshot) -> bool:
+    """True when ``test_id`` is suspected or confirmed flaky: never served from or written to cache."""
+    return snapshot.blocks_cache(test_id)
 
-    TODO(M7): consult the flake store. Until it exists no test is blocked.
-    """
-    return False
+
+def _flake_store(cfg: Config) -> FlakeStore:
+    return FlakeStore(
+        cfg.resolve(cfg.flakes.db),
+        min_runs=cfg.flakes.min_runs,
+        window_days=cfg.flakes.window_days,
+        min_flips_confirmed=cfg.flakes.min_flips_confirmed,
+    )
 
 
 def _check_run(out: RunOutput, ids: list[str], invoke_id: dict[str, str]) -> None:
@@ -490,7 +503,10 @@ def execute_run(cfg: Config, options: RunOptions) -> RunOutcome:
     # Reads are skipped only when the fallback actually fired (Section 5.9).
     read_cache = cache_on and not plan.selection.fallback_full_run
     result_cache = ResultCache(cfg.resolve(cfg.cache.dir))
-    keys = _KeyBuilder(cfg, plan) if cache_on and plan.selected else None
+    # Keys also give each test its code_hash for the flake store.
+    keys = _KeyBuilder(cfg, plan) if plan.selected else None
+    store = _flake_store(cfg)
+    flakes_before = store.snapshot()
     env = plan.env
     base_ref = plan.base.base_ref if plan.base else ""
     hits: dict[str, TestResult] = {}
@@ -502,7 +518,7 @@ def execute_run(cfg: Config, options: RunOptions) -> RunOutcome:
         if keys is None or not read_cache:
             return found
         for test_id in plan.selected:
-            if cache_blocked_by_flakes(cfg, test_id):
+            if cache_blocked_by_flakes(cfg, test_id, flakes_before):
                 continue
             stored = result_cache.get(keys.key(test_id, plan.item_file[test_id], current))
             if stored is not None and stored.get("test_id") == test_id:
@@ -560,7 +576,28 @@ def execute_run(cfg: Config, options: RunOptions) -> RunOutcome:
     except (GitError, RunnerError) as exc:
         raise RunError(str(exc)) from exc
 
-    results = [hits[t] if t in hits else executed[t] for t in plan.selected]
+    # Flake history: freshly executed outcomes only, never cache replays (Section 5.9).
+    code_hashes: dict[str, str] = {}
+    if keys is not None:
+        for test_id in plan.selected:
+            inputs = keys.inputs(plan.item_file[test_id], env.inipath)
+            code_hashes[test_id] = code_hash(test_id, inputs)
+        for test_id, result in executed.items():
+            store.record(
+                test_id=test_id,
+                code_hash=code_hashes[test_id],
+                outcome=result.outcome,
+                started_at=utc_now_iso(),
+                duration_ms=result.duration_ms,
+                run_id=str(run_id),
+                commit_sha=info.sha,
+                error_message=result.failure.error_message[:500] if result.failure else None,
+            )
+    flakes_after = store.snapshot()
+    results = [
+        (hits[t] if t in hits else executed[t]).model_copy(update={"flaky": flakes_after.info(t)})
+        for t in plan.selected
+    ]
     pytest_stdout = "".join(stdout_parts)
     if stdout_parts:
         (run_dir / "pytest-stdout.txt").write_text(pytest_stdout, encoding="utf-8", newline="\n")
@@ -569,15 +606,31 @@ def execute_run(cfg: Config, options: RunOptions) -> RunOutcome:
         # Replayed hits are never re-written and never enter flake history
         # (Section 5.9): only fresh executions feed both.
         for test_id, result in executed.items():
-            if result.outcome in CACHEABLE_OUTCOMES and not cache_blocked_by_flakes(cfg, test_id):
+            if result.outcome in CACHEABLE_OUTCOMES and not cache_blocked_by_flakes(
+                cfg, test_id, flakes_after
+            ):
                 key = keys.key(test_id, plan.item_file[test_id], env)
                 result_cache.put(key, result.to_json())
         trim_caches([result_cache.directory, cfg.resolve(cfg.cache.collect_cache_dir)])
 
     duration_ms = round((time.monotonic() - t0) * 1000)
     counts = _counts(results)
+    # --allow-known-flakes excuses confirmed/ignored flakes on unchanged code only.
+    blocking = [
+        r
+        for r in results
+        if r.outcome in ("failed", "error")
+        and not (
+            options.allow_known_flakes
+            and flakes_after.allowed_failure(r.test_id, code_hashes.get(r.test_id))
+        )
+    ]
     outcome: Literal["passed", "failed", "error"] = (
-        "failed" if counts.failed else "error" if counts.error else "passed"
+        "failed"
+        if any(r.outcome == "failed" for r in blocking)
+        else "error"
+        if blocking
+        else "passed"
     )
     failures = [
         FailureSummary(
@@ -586,7 +639,7 @@ def execute_run(cfg: Config, options: RunOptions) -> RunOutcome:
             error_message=r.failure.error_message,
             file=r.failure.file or r.location.file,
             line=r.failure.line if r.failure.file else r.location.line,
-            is_flaky=False,
+            is_flaky=bool(r.flaky and r.flaky.is_flaky),
             repro_command=r.failure.repro_command,
         )
         for r in results
@@ -631,7 +684,7 @@ def execute_run(cfg: Config, options: RunOptions) -> RunOutcome:
         # TODO(M9): the savings ledger replaces this stub (spec milestone M5).
         write_last_tree(cfg.repo_root, plan.branch, info.tree)
 
-    exit_code = 1 if (counts.failed or counts.error) else 0
+    exit_code = 1 if blocking else 0
     return RunOutcome(
         summary=summary,
         results=results,

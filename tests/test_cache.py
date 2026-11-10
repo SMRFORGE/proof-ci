@@ -13,7 +13,6 @@ from typing import Any
 import pytest
 from typer.testing import CliRunner
 
-from proof_ci import runner as runner_mod
 from proof_ci.cache import (
     ResultCache,
     conftest_chain,
@@ -252,13 +251,15 @@ def test_fired_fallback_reads_nothing(demo: Path) -> None:
     assert summary2["cache"]["hits"] == 2  # all but the deliberate failure
 
 
-def test_flaky_blocked_tests_are_not_served(demo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_flaky_blocked_tests_are_not_served(demo: Path) -> None:
     run_all(demo)
-    monkeypatch.setattr(
-        runner_mod, "cache_blocked_by_flakes", lambda cfg, t: t == "tests/test_math.py::test_add"
+    result = cli.invoke(
+        app, ["flakes", "mark", "tests/test_math.py::test_add", "--repo", str(demo)]
     )
+    assert result.exit_code == 0, result.output
     rows = results_of(demo, run_all(demo))
     assert rows["tests/test_math.py::test_add"]["cache_hit"] is False
+    assert rows["tests/test_math.py::test_add"]["flaky"]["status"] == "confirmed"
     assert rows["tests/test_math.py::test_div"]["cache_hit"] is True
 
 

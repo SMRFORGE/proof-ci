@@ -292,6 +292,13 @@ def run(
         bool, typer.Option("--no-cache", help="Bypass the result and collection caches.")
     ] = False,
     sign: Annotated[bool, typer.Option("--sign", help="Sign a RunRecord for this run.")] = False,
+    allow_known_flakes: Annotated[
+        bool,
+        typer.Option(
+            "--allow-known-flakes",
+            help="Do not fail on confirmed or ignored flaky tests (unchanged code only).",
+        ),
+    ] = False,
     *,
     common: CommonOptions,
 ) -> None:
@@ -314,6 +321,7 @@ def run(
                 json_output=common.json_output,
                 base=base,
                 no_cache=no_cache,
+                allow_known_flakes=allow_known_flakes,
             ),
         )
     except ConfigError as exc:
@@ -343,7 +351,8 @@ def run(
             typer.echo(sel.fallback_reason or "full run (fallback)")
         for f in summary.failures:
             where = f"{f.file}:{f.line}" if f.line else f.file
-            typer.echo(f"FAILED {f.test_id} ({where})")
+            label = "FAILED (known flaky)" if f.is_flaky else "FAILED"
+            typer.echo(f"{label} {f.test_id} ({where})")
             first = f.error_message.splitlines()[0] if f.error_message else ""
             typer.echo(f"  {f.error_type}: {first}")
             typer.echo(f"  repro: {f.repro_command}")
@@ -404,3 +413,119 @@ def affected(
         return
     for test_id in plan.selected:
         typer.echo(test_id)
+
+
+flakes_app = typer.Typer(
+    help="Inspect and manage the local flake store.",
+    no_args_is_help=True,
+    rich_markup_mode=None,
+    pretty_exceptions_enable=False,
+)
+app.add_typer(flakes_app, name="flakes")
+
+_FLAKE_STATUSES = ("suspected", "confirmed", "resolved", "ignored")
+
+
+def _store_for(common: CommonOptions) -> Any:
+    from proof_ci.runner import _flake_store
+
+    try:
+        cfg = load_config(common.repo, common.config)
+    except ConfigError as exc:
+        raise _fail(str(exc), EXIT_USAGE) from exc
+    return _flake_store(cfg)
+
+
+def _print_flake(record: Any) -> None:
+    typer.echo(
+        f"{record.status:<10} pass={record.pass_count} fail={record.fail_count} "
+        f"flips={record.flip_count}  {record.test_id}"
+    )
+    if record.reason:
+        typer.echo(f"           {record.reason}")
+
+
+@flakes_app.command("list")
+@common_options
+def flakes_list(
+    status: Annotated[
+        str | None,
+        typer.Option(
+            "--status",
+            help="suspected|confirmed|resolved|ignored|all (default: suspected and confirmed).",
+        ),
+    ] = None,
+    *,
+    common: CommonOptions,
+) -> None:
+    """List flake records."""
+    if status is None:
+        statuses: tuple[str, ...] = ("suspected", "confirmed")
+    elif status == "all":
+        statuses = ("suspected", "confirmed", "ignored")
+    elif status in _FLAKE_STATUSES:
+        statuses = (status,)
+    else:
+        raise _fail(f"unknown --status {status!r}", EXIT_USAGE)
+    records = _store_for(common).list_records(statuses)
+    if common.json_output:
+        emit_json({"flakes": [r.to_json() for r in records]})
+        return
+    if not records:
+        typer.echo("No flaky tests recorded.")
+    for record in records:
+        _print_flake(record)
+
+
+@flakes_app.command("show")
+@common_options
+def flakes_show(
+    test_id: Annotated[str, typer.Argument(metavar="TEST_ID")],
+    *,
+    common: CommonOptions,
+) -> None:
+    """Show one flake record."""
+    record = _store_for(common).get(test_id)
+    if record is None:
+        raise _fail(f"no flake record for {test_id}", EXIT_USAGE)
+    if common.json_output:
+        emit_json(record.to_json())
+    else:
+        _print_flake(record)
+
+
+@flakes_app.command("mark")
+@common_options
+def flakes_mark(
+    test_id: Annotated[str, typer.Argument(metavar="TEST_ID")],
+    status: Annotated[str, typer.Option("--status", help="confirmed or ignored.")] = "confirmed",
+    reason: Annotated[str | None, typer.Option("--reason", metavar="TEXT")] = None,
+    *,
+    common: CommonOptions,
+) -> None:
+    """Mark a test as flaky by hand (confirmed or ignored)."""
+    if status not in ("confirmed", "ignored"):
+        raise _fail("--status must be confirmed or ignored", EXIT_USAGE)
+    record = _store_for(common).mark(test_id, status, reason)
+    if common.json_output:
+        emit_json(record.to_json())
+    else:
+        _print_flake(record)
+
+
+@flakes_app.command("unmark")
+@common_options
+def flakes_unmark(
+    test_id: Annotated[str, typer.Argument(metavar="TEST_ID")],
+    reason: Annotated[str | None, typer.Option("--reason", metavar="TEXT")] = None,
+    *,
+    common: CommonOptions,
+) -> None:
+    """Clear a flake flag (status becomes resolved; history is kept)."""
+    record = _store_for(common).unmark(test_id, reason)
+    if record is None:
+        raise _fail(f"no flake record for {test_id}", EXIT_USAGE)
+    if common.json_output:
+        emit_json(record.to_json())
+    else:
+        _print_flake(record)
