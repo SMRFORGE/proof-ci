@@ -330,6 +330,8 @@ def run(
                 base=base,
                 no_cache=no_cache,
                 allow_known_flakes=allow_known_flakes,
+                calibrate=all_tests and cfg.savings.refresh_calibration_on_all,
+                agent_id=agent_id,
             ),
         )
     except ConfigError as exc:
@@ -368,6 +370,9 @@ def run(
             first = f.error_message.splitlines()[0] if f.error_message else ""
             typer.echo(f"  {f.error_type}: {first}")
             typer.echo(f"  repro: {f.repro_command}")
+        if summary.savings_headline:
+            typer.echo(summary.savings_headline)
+        _payoff_note(summary.savings)
         typer.echo(f"Results: {summary.results_path}")
         if summary.record_path:
             typer.echo(f"Signed record: {summary.record_path}")
@@ -631,6 +636,9 @@ def _attach_record(cfg: Any, run_dir: Path, summary: Any, signed: Any) -> Any:
     except ValueError:
         record_path = signed.path.as_posix()
     updated = summary.model_copy(update={"record_path": record_path})
+    from proof_ci.savings import SavingsLedger
+
+    SavingsLedger(cfg.resolve(cfg.savings.db)).set_record_path(str(summary.run_id), record_path)
     _write_json(run_dir / "summary.json", updated.to_json())
     last = cfg.repo_root / ".proof-ci" / "last-run.json"
     if last.is_file():
@@ -805,3 +813,114 @@ def record_verify(
     else:
         typer.echo(f"invalid: {result.reason}")
     raise typer.Exit(0 if result.valid else EXIT_VERIFY)
+
+
+def _payoff_note(savings: Any) -> None:
+    """Repeat the calibration verdict once when plain pytest is faster here."""
+    if savings is None or savings.calibration.payoff != "overhead_dominates":
+        return
+    from proof_ci.savings import payoff_sentence
+
+    cal = savings.calibration
+    typer.echo(
+        payoff_sentence(cal.payoff, cal.full_suite_wall_ms or 0, cal.fixed_overhead_ms or 0),
+        err=True,
+    )
+
+
+savings_app = typer.Typer(
+    help="Report what proof-ci saved (time and counts first; money only when prices are set).",
+    invoke_without_command=True,
+    rich_markup_mode=None,
+    pretty_exceptions_enable=False,
+)
+app.add_typer(savings_app, name="savings")
+
+
+@savings_app.callback(invoke_without_command=True)
+@common_options
+def savings_report(
+    ctx: typer.Context,
+    since: Annotated[str, typer.Option("--since", metavar="WHEN")] = "30d",
+    until: Annotated[str | None, typer.Option("--until", metavar="WHEN")] = None,
+    by: Annotated[str, typer.Option("--by", help="repo, agent, or branch.")] = "repo",
+    weekly: Annotated[bool, typer.Option("--weekly", help="Also bucket by ISO week.")] = False,
+    *,
+    common: CommonOptions,
+) -> None:
+    """Summarise the local savings ledger as a SavingsReport."""
+    if ctx.invoked_subcommand is not None:
+        return
+    from datetime import UTC, datetime
+
+    from proof_ci.savings import SavingsLedger, build_report, parse_when
+
+    if by not in ("repo", "agent", "branch"):
+        raise _fail("--by must be repo, agent, or branch", EXIT_USAGE)
+    try:
+        start = parse_when(since)
+        end = parse_when(until) if until else datetime.now(UTC)
+    except ValueError as exc:
+        raise _fail(str(exc), EXIT_USAGE) from exc
+    try:
+        cfg = load_config(common.repo, common.config)
+    except ConfigError as exc:
+        raise _fail(str(exc), EXIT_USAGE) from exc
+    fmt = "%Y-%m-%dT%H:%M:%S.%f"
+    try:
+        rows = SavingsLedger(cfg.resolve(cfg.savings.db)).rows(
+            start.strftime(fmt)[:-3] + "Z", end.strftime(fmt)[:-3] + "Z"
+        )
+    except Exception as exc:  # sqlite errors: the ledger cannot be read
+        raise _fail(f"cannot read the savings ledger: {exc}", EXIT_RUNTIME) from exc
+    report = build_report(
+        rows,
+        since=start,
+        until=end,
+        group_by=by,  # type: ignore[arg-type]
+        weekly=weekly,
+        repo_name=cfg.project_name,
+    )
+    if common.json_output:
+        emit_json(report.to_json())
+        return
+    typer.echo(report.headline)
+    for group in report.groups:
+        week = f" {group.week}" if group.week else ""
+        g = group.totals
+        typer.echo(
+            f"  {group.key}{week}: {group.runs} run(s), flaky flagged {g.wrong_turns_avoided}, "
+            f"CI runs avoided {g.ci_runs_avoided}, local test-min ~{g.test_ms_not_executed // 60000}"
+        )
+    if report.defaults_used:
+        typer.echo(
+            f"Default prices in use: {', '.join(report.defaults_used)} (no dollar figures shown)"
+        )
+
+
+@savings_app.command("calibrate")
+@common_options
+def savings_calibrate(*, common: CommonOptions) -> None:
+    """Run the full suite to measure per-test durations and proof-ci's own overhead."""
+    from proof_ci.runner import RunError, RunOptions, execute_run
+    from proof_ci.savings import payoff_sentence
+
+    try:
+        cfg = load_config(common.repo, common.config)
+        outcome = execute_run(
+            cfg, RunOptions(mode="all", json_output=common.json_output, calibrate=True)
+        )
+    except ConfigError as exc:
+        raise _fail(str(exc), EXIT_USAGE) from exc
+    except RunError as exc:
+        raise _fail(str(exc), EXIT_RUNTIME) from exc
+    savings = outcome.savings
+    if common.json_output:
+        emit_json(savings.to_json() if savings else {})
+    elif savings is not None:
+        cal = savings.calibration
+        typer.echo(outcome.summary.summary)
+        typer.echo(
+            payoff_sentence(cal.payoff, cal.full_suite_wall_ms or 0, cal.fixed_overhead_ms or 0)
+        )
+    raise typer.Exit(outcome.exit_code)

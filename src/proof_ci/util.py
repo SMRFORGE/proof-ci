@@ -106,7 +106,9 @@ def tree_hash(repo: Path) -> str:
         else:
             tmp.unlink()  # git creates a fresh index when the file is absent
         env = {**os.environ, "GIT_INDEX_FILE": str(tmp)}
+        # proof-ci's own state is never part of the tested tree, ignored or not.
         run_git(repo, "add", "-A", env=env)
+        run_git(repo, "rm", "-r", "-q", "--cached", "--ignore-unmatch", "--", ".proof-ci", env=env)
         # `add -A` honours .git/info/exclude and core.excludesFile, which are local
         # to this machine. A file hidden that way could change test outcomes while
         # the record claims the committed tree, so untracked files are also added

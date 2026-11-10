@@ -802,7 +802,7 @@ def build_report(
     groups = [
         SavingsGroup(
             key=k,
-            week=w,
+            **({"week": w} if w is not None else {}),
             runs=len(rs),
             totals=_totals(rs),
             overall_confidence=_overall(rs),

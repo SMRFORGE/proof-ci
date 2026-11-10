@@ -186,7 +186,7 @@ def test_run_sign_then_verify(demo: Path, keyfile: Path) -> None:
     )
     assert payload["summary"]["executed"] == 2
     assert payload["agent"] == {"id": "agent-7"}
-    assert "savings" not in payload  # omitted until M9, never an empty object
+    assert payload["savings"]["headline"] == summary["savings_headline"]  # signed with the rest
     assert doc["signature"]["key_id"] == key_id(base64.b64decode(doc["signature"]["public_key"]))
     text = record_path.read_text(encoding="utf-8")
     assert "PRIVATE KEY" not in text

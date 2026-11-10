@@ -9,12 +9,14 @@ RunSummary, results.json, and last-run.json. The result cache (M6), flakes
 from __future__ import annotations
 
 import json
+import os
 import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal
 
+from proof_ci.adapters.agent.identity import resolve_identity
 from proof_ci.adapters.runners.pytest_runner import PytestRunner, RunnerError, RunOutput
 from proof_ci.affected import (
     BaseResolution,
@@ -28,7 +30,6 @@ from proof_ci.affected import (
     read_last_tree,
     resolve_base,
     select,
-    write_last_tree,
 )
 from proof_ci.cache import (
     CACHEABLE_OUTCOMES,
@@ -50,9 +51,11 @@ from proof_ci.models import (
     Counts,
     FailureSummary,
     RunSummary,
+    Savings,
     Selection,
     TestResult,
 )
+from proof_ci.savings import RunFacts, SavingsLedger, compute_savings, ledger_row
 from proof_ci.util import CaseIndex, GitError, GitInfo, debug, git_info, run_git, utc_now_iso
 
 __all__ = [
@@ -82,6 +85,8 @@ class RunOptions:
     base: str | None = None
     no_cache: bool = False
     allow_known_flakes: bool = False
+    calibrate: bool = False
+    agent_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -92,6 +97,7 @@ class RunOutcome:
     pytest_stdout: str
     notes: list[str] = field(default_factory=list)
     run_dir: Path | None = None
+    savings: Savings | None = None
 
 
 def _validate_test_args(cfg: Config, tests: tuple[str, ...]) -> None:
@@ -298,7 +304,11 @@ def plan_selection(
     notes: list[str] = []
     graph: ImportGraph | None = None
     if options.mode == "affected":
-        tree_last = read_last_tree(cfg.repo_root, branch) if branch else None
+        tree_last = None
+        if branch:
+            tree_last = SavingsLedger(cfg.resolve(cfg.savings.db)).last_tree(branch)
+            if tree_last is None:  # M5 stub, migrated into the ledger on the next run
+                tree_last = read_last_tree(cfg.repo_root, branch)
         fallback = decide_fallback(
             cfg.repo_root,
             changed,
@@ -476,6 +486,85 @@ class _KeyBuilder:
         )
 
 
+def _savings(
+    cfg: Config,
+    options: RunOptions,
+    plan: SelectionPlan,
+    summary: RunSummary,
+    results: list[TestResult],
+    *,
+    hits: list[str],
+    executed: dict[str, TestResult],
+    pytest_ms: int,
+    pytest_stdout: str,
+    extra: tuple[str, ...],
+    env: CollectEnv,
+    info: GitInfo,
+) -> Savings:
+    """Calibrate when asked, compute the Savings object, and append the ledger row."""
+    ledger = SavingsLedger(cfg.resolve(cfg.savings.db))
+    if options.calibrate and plan.selected:
+        durations = {
+            t: r.duration_ms
+            for t, r in executed.items()
+            if r.outcome in ("passed", "failed", "skipped", "xfailed", "xpassed")
+        }
+        ledger.write_calibration(
+            wall_ms=pytest_ms,
+            fixed_overhead_ms=max(0, summary.duration_ms - pytest_ms),
+            durations=durations,
+            commit_sha=info.sha,
+            python=env.python,
+            platform=env.platform,
+            run_id=str(summary.run_id),
+        )
+    deselected = (
+        [t for t in plan.collected_ids if t not in set(plan.selected)]
+        if plan.mode == "affected" and not plan.selection.fallback_full_run
+        else []
+    )
+    facts = RunFacts(
+        is_calibration_run=options.calibrate,
+        results=results,
+        selected_count=len(plan.selected),
+        collected_count=len(plan.collected_ids),
+        deselected_ids=deselected,
+        cache_hit_ids=hits,
+        outcome=summary.outcome,
+        failed_count=summary.counts.failed,
+        flaky_failures=summary.counts.flaky_failures,
+        actual_ms=summary.duration_ms,
+        pytest_stdout=pytest_stdout,
+        pytest_flags=" ".join(extra),
+        branch=plan.branch,
+        commit_tree=info.tree,
+    )
+
+    def structured_bytes(headline: str) -> int:
+        doc = summary.model_copy(update={"savings_headline": headline}).to_json()
+        doc.pop("savings", None)
+        return len((json.dumps(doc, ensure_ascii=False, indent=2) + "\n").encode("utf-8"))
+
+    savings = compute_savings(facts, cfg.savings, ledger, structured_bytes_for=structured_bytes)
+    identity = resolve_identity(options.agent_id, cfg.record.agent_id, os.environ)
+    ledger.append(
+        ledger_row(
+            savings,
+            run_id=str(summary.run_id),
+            commit_sha=info.sha,
+            commit_tree=info.tree,
+            branch=plan.branch,
+            agent_id=identity.id,
+            agent_name=identity.agent_name,
+            outcome=summary.outcome,
+            selected_count=len(plan.selected),
+            collected_count=len(plan.collected_ids),
+            duration_ms=summary.duration_ms,
+        )
+    )
+    return savings
+
+
 # ------------------------------------------------------------------------ run
 
 
@@ -502,7 +591,7 @@ def execute_run(cfg: Config, options: RunOptions) -> RunOutcome:
 
     cache_on = cfg.cache.enabled and not options.no_cache
     # Reads are skipped only when the fallback actually fired (Section 5.9).
-    read_cache = cache_on and not plan.selection.fallback_full_run
+    read_cache = cache_on and not plan.selection.fallback_full_run and not options.calibrate
     result_cache = ResultCache(cfg.resolve(cfg.cache.dir))
     # Keys also give each test its code_hash for the flake store.
     keys = _KeyBuilder(cfg, plan) if plan.selected else None
@@ -526,8 +615,13 @@ def execute_run(cfg: Config, options: RunOptions) -> RunOutcome:
                 found[test_id] = TestResult.model_validate({**stored, "cache_hit": True})
         return found
 
+    pytest_ms = 0
+
     def execute(ids: list[str]) -> RunOutput:
+        nonlocal pytest_ms
+        started_pytest = time.monotonic()
         out = runner.run([plan.invoke_id[t] for t in ids], extra)
+        pytest_ms += round((time.monotonic() - started_pytest) * 1000)
         _check_run(out, ids, plan.invoke_id)
         stdout_parts.append(out.stdout)
         for raw in out.results:
@@ -678,14 +772,28 @@ def execute_run(cfg: Config, options: RunOptions) -> RunOutcome:
         record_path=None,
         **summary_kwargs,
     )
+    savings = _savings(
+        cfg,
+        options,
+        plan,
+        summary,
+        results,
+        hits=list(hits),
+        executed=executed,
+        pytest_ms=pytest_ms,
+        pytest_stdout=pytest_stdout,
+        extra=extra,
+        env=env,
+        info=info,
+    )
+    summary = summary.model_copy(update={"savings": savings, "savings_headline": savings.headline})
     _write_json(results_path, [r.to_json() for r in results])
     _write_json(run_dir / "summary.json", summary.to_json())
     # The interpreter that ran pytest, for RunRecord.payload.environment (M8).
     _write_json(run_dir / "environment.json", {"python": env.python, "platform": env.platform})
     _write_json(cfg.repo_root / STATE_DIR / "last-run.json", summary.to_json())
-    if plan.branch and info.tree:
-        # TODO(M9): the savings ledger replaces this stub (spec milestone M5).
-        write_last_tree(cfg.repo_root, plan.branch, info.tree)
+    for stub in (cfg.repo_root / STATE_DIR).glob("last-tree-*.txt"):
+        stub.unlink(missing_ok=True)  # the ledger now holds the last tree per branch
 
     exit_code = 1 if blocking else 0
     return RunOutcome(
@@ -695,4 +803,5 @@ def execute_run(cfg: Config, options: RunOptions) -> RunOutcome:
         pytest_stdout=pytest_stdout,
         notes=plan.notes,
         run_dir=run_dir,
+        savings=savings,
     )

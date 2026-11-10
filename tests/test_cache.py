@@ -35,7 +35,9 @@ def demo(tmp_path: Path) -> Path:
     repo = tmp_path / "demo"
     shutil.copytree(DEMO, repo, ignore=shutil.ignore_patterns(".proof-ci", "__pycache__"))
     (repo / "proof-ci.toml").write_text(
-        f"[project]\ntest_command = {json.dumps([sys.executable, '-m', 'pytest'])}\n",
+        f"[project]\ntest_command = {json.dumps([sys.executable, '-m', 'pytest'])}\n"
+        # run --all would otherwise refresh calibration, which never reads the cache.
+        "[savings]\nrefresh_calibration_on_all = false\n",
         encoding="utf-8",
     )
     return repo
