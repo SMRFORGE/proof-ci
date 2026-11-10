@@ -348,7 +348,7 @@ def run(
         elif outcome.run_dir is not None:
             try:
                 out = _record_output(cfg, outcome.run_dir, record_out)
-                signed = _sign(cfg, outcome.run_dir, agent_id, None, out, recheck_tree=False)
+                signed = _sign(cfg, outcome.run_dir, agent_id, None, out)
                 summary = _attach_record(cfg, outcome.run_dir, summary, signed)
             except _SignFailure as exc:
                 sign_refused = (exc.message, exc.code)
@@ -372,7 +372,12 @@ def run(
         if summary.record_path:
             typer.echo(f"Signed record: {summary.record_path}")
     if sign_refused is not None:
-        raise _fail(*sign_refused)
+        message, code = sign_refused
+        if outcome.exit_code == 1:
+            # Test failures take precedence: callers checking for 1 must not miss them.
+            typer.echo(f"error: {message}", err=True)
+            raise typer.Exit(1)
+        raise _fail(message, code)
     raise typer.Exit(outcome.exit_code)
 
 
@@ -561,10 +566,28 @@ def _record_output(cfg: Any, run_dir: Path, requested: Path | None) -> Path:
         return run_dir / "record.json"
     target = requested if requested.is_absolute() else Path.cwd() / requested
     target = target.resolve()
+    root = cfg.repo_root.resolve()
     try:
-        target.relative_to(cfg.repo_root.resolve())
+        rel = target.relative_to(root)
     except ValueError as exc:
         raise _SignFailure(f"{requested} resolves outside the repository", EXIT_USAGE) from exc
+    from proof_ci.util import GitError, run_git
+
+    try:
+        for flag in ("--git-dir", "--git-common-dir"):
+            out = run_git(root, "rev-parse", flag, check=False)
+            if out.returncode == 0 and out.stdout.strip():
+                git_dir = Path(out.stdout.strip())
+                git_dir = (git_dir if git_dir.is_absolute() else root / git_dir).resolve()
+                if target == git_dir or git_dir in target.parents:
+                    raise _SignFailure(f"{requested} is inside the git directory", EXIT_USAGE)
+        tracked = run_git(root, "ls-files", "--error-unmatch", "--", rel.as_posix(), check=False)
+        if tracked.returncode == 0:
+            raise _SignFailure(
+                f"{requested} is a tracked file; refusing to overwrite it", EXIT_USAGE
+            )
+    except GitError:
+        pass
     return target
 
 
@@ -574,8 +597,6 @@ def _sign(
     agent_id: str | None,
     key: Path | None,
     output: Path,
-    *,
-    recheck_tree: bool,
 ) -> Any:
     import os
 
@@ -592,7 +613,6 @@ def _sign(
             identity,
             resolve_key_path(cfg, key),
             output,
-            recheck_tree=recheck_tree,
         )
     except SignError as exc:
         raise _SignFailure(str(exc), EXIT_RUNTIME if exc.runtime else EXIT_USAGE) from exc
@@ -694,7 +714,7 @@ def record_sign(
         raise _fail(f"no run directory for {run_id}", EXIT_USAGE)
     try:
         out = _record_output(cfg, run_dir, output)
-        signed = _sign(cfg, run_dir, agent_id, key, out, recheck_tree=True)
+        signed = _sign(cfg, run_dir, agent_id, key, out)
     except _SignFailure as exc:
         raise _fail(exc.message, exc.code) from exc
     from proof_ci.models import RunSummary
@@ -742,9 +762,11 @@ def record_verify(
     )
 
     trusted: list[bytes] = []
+    trust_source: str | None = None
     try:
         if pubkey is not None:
             trusted = [load_public_key(pubkey)]
+            trust_source = "--pubkey"
         elif key is not None:
             private, _warnings = load_private_key(key)
             from cryptography.hazmat.primitives import serialization
@@ -754,10 +776,13 @@ def record_verify(
                     serialization.Encoding.Raw, serialization.PublicFormat.Raw
                 )
             ]
+            trust_source = "--key"
         else:
             try:
                 cfg = load_config(common.repo, common.config)
                 trusted = [load_public_key(cfg.resolve(p)) for p in cfg.record.trusted_pubkeys]
+                if trusted:
+                    trust_source = f"config:{cfg.config_path.as_posix()}"
             except ConfigError:
                 trusted = []
     except KeyError_ as exc:
@@ -765,8 +790,16 @@ def record_verify(
     result = verify_record(path, trusted, require_known_key=require_known_key)
     if result.valid and result.signer == "unknown":
         _warn("verified against the embedded public key: this proves integrity, not identity")
+    if result.valid and trust_source and trust_source.startswith("config:"):
+        _warn(
+            f"trusted keys came from {trust_source[7:]}, which the repository controls; "
+            "reviewers should pass --pubkey obtained out of band"
+        )
     if common.json_output:
-        emit_json(result.as_json())
+        data = result.as_json()
+        if result.valid:
+            data["trust_source"] = trust_source
+        emit_json(data)
     elif result.valid:
         typer.echo(f"valid: run {result.run_id}, key {result.key_id}, signer {result.signer}")
     else:

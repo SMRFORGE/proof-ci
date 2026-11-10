@@ -286,7 +286,7 @@ def test_record_sign_last_run_and_tree_change(demo: Path, keyfile: Path) -> None
     (demo / "new.txt").write_text("x", encoding="utf-8")  # changes the working tree
     again = cli.invoke(app, ["record", "sign", "--repo", str(demo)])
     assert again.exit_code == 2
-    assert "working tree changed" in again.stderr
+    assert "no longer matches" in again.stderr
 
 
 def test_record_sign_refuses_zero_test_run(demo: Path, keyfile: Path) -> None:
@@ -392,34 +392,60 @@ def test_modeless_filesystem_exception(tmp_path: Path, monkeypatch: pytest.Monke
 
 
 @pytest.mark.skipif(not WINDOWS, reason="Windows ACLs")
-def test_windows_owner_only_acl_and_refusal(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "grant", ["*S-1-5-32-545:R", "*S-1-5-32-546:R", "*S-1-5-7:R", "*S-1-1-0:R", "*S-1-5-4:R"]
+)
+def test_windows_owner_only_acl_and_refusal(tmp_path: Path, grant: str) -> None:
     key = tmp_path / "k.pem"
     generate_keypair(key)
-    out = subprocess.run(["icacls", str(key)], capture_output=True, text=True, check=True).stdout
-    assert os.environ["USERNAME"].lower() in out.lower()
-    assert rec._parse_icacls(out, str(key)) == []
+    assert rec._windows_unsafe_principals(key) == []
     assert check_key_protection(key) == []
-    subprocess.run(
-        ["icacls", str(key), "/grant", "*S-1-5-32-545:R"], capture_output=True, check=True
-    )
+    # Users, Guests, ANONYMOUS LOGON, Everyone, INTERACTIVE: all refused (allow-list).
+    subprocess.run(["icacls", str(key), "/grant", grant], capture_output=True, check=True)
     with pytest.raises(KeyError_, match="readable by"):
         check_key_protection(key)
 
 
-def test_parse_icacls() -> None:
-    path = r"C:\k\ed25519.pem"
-    owner_only = f"{path} LAPTOP\\me:(F)\n\nSuccessfully processed 1 files"
-    assert rec._parse_icacls(owner_only, path) == []
-    loose = (
-        f"{path} BUILTIN\\Users:(RX)\n         NT AUTHORITY\\SYSTEM:(F)\n"
-        "         Everyone:(R)\n         NT AUTHORITY\\Authenticated Users:(M)\n"
-        "         BUILTIN\\Administrators:(F)\n"
-    )
-    assert rec._parse_icacls(loose, path) == [
-        "BUILTIN\\Users",
-        "Everyone",
-        "NT AUTHORITY\\Authenticated Users",
+def test_parse_sddl_allow_list() -> None:
+    user = "S-1-5-21-1-2-3-1001"
+    owner_only = f"D:PAI(A;;FA;;;{user})"
+    assert rec._unsafe_sids(rec._parse_sddl(owner_only), user) == []
+    admin_system = f"D:PAI(A;;FA;;;{user})(A;;FA;;;SY)(A;;FA;;;BA)"
+    assert rec._unsafe_sids(rec._parse_sddl(admin_system), user) == []
+    loose = f"D:AI(A;;FR;;;BG)(A;;FA;;;{user})(A;ID;0x1200a9;;;WD)(A;;FR;;;S-1-5-21-9-9-9-500)"
+    assert rec._unsafe_sids(rec._parse_sddl(loose), user) == [
+        "S-1-1-0",
+        "S-1-5-21-9-9-9-500",
+        "S-1-5-32-546",
     ]
+    deny_only = f"D:PAI(D;;FA;;;WD)(A;;FA;;;{user})"
+    assert rec._unsafe_sids(rec._parse_sddl(deny_only), user) == []
+    assert rec._parse_sddl("garbage") == []
+
+
+def test_unreadable_acl_warns(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    if not WINDOWS:
+        pytest.skip("Windows ACLs")
+    key = tmp_path / "k.pem"
+    generate_keypair(key)
+    monkeypatch.setattr(rec, "_windows_unsafe_principals", lambda p: None)
+    warnings = check_key_protection(key)
+    assert warnings and "could not inspect" in warnings[0]
+
+
+def test_keygen_failure_leaves_no_key(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def boom(*a: object, **k: object) -> None:
+        raise KeyError_("cannot restrict")
+
+    if WINDOWS:
+        monkeypatch.setattr(rec, "_protect_windows", boom)
+    else:
+        monkeypatch.setattr(rec.os, "chmod", boom)
+    key = tmp_path / "k.pem"
+    with pytest.raises(KeyError_):
+        generate_keypair(key)
+    assert not key.exists()
+    assert not key.with_name("k.pem.pub").exists()
 
 
 def test_windows_user_prefers_username(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -466,3 +492,177 @@ def test_identity_resolution_is_generic() -> None:
     assert resolve_identity(None, "cfg-id", {}).id == "cfg-id"
     fallback = resolve_identity(None, "", {})
     assert (fallback.id, fallback.defaulted) == ("local", True)
+
+
+# ------------------------------------------------- review regression tests
+
+
+def run_dir_of(repo: Path, summary: dict[str, Any]) -> Path:
+    return repo / Path(summary["results_path"]).parent
+
+
+def plain_run(repo: Path, *tests: str) -> dict[str, Any]:
+    result = cli.invoke(app, ["run", *tests, "--json", "--repo", str(repo)])
+    assert result.exit_code in (0, 1), result.output
+    data: dict[str, Any] = json.loads(result.stdout)
+    return data
+
+
+def test_record_sign_refuses_edited_counts(demo: Path, keyfile: Path) -> None:
+    summary = plain_run(demo, "tests/test_math.py")  # 2 passed, 1 failed
+    run_dir = run_dir_of(demo, summary)
+    doc = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
+    doc["outcome"] = "passed"
+    doc["counts"]["passed"] = 999
+    doc["counts"]["failed"] = 0
+    (run_dir / "summary.json").write_text(json.dumps(doc), encoding="utf-8")
+    result = cli.invoke(app, ["record", "sign", "--run", summary["run_id"], "--repo", str(demo)])
+    assert result.exit_code == 2
+    assert "inconsistent" in result.stderr
+
+
+def test_record_sign_refuses_results_outside_run_dir(
+    demo: Path, keyfile: Path, tmp_path: Path
+) -> None:
+    summary = plain_run(demo, "tests/test_text.py")
+    run_dir = run_dir_of(demo, summary)
+    outside = tmp_path / "ext_results.json"
+    shutil.copy(demo / summary["results_path"], outside)
+    doc = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
+    doc["results_path"] = str(outside)
+    (run_dir / "summary.json").write_text(json.dumps(doc), encoding="utf-8")
+    result = cli.invoke(app, ["record", "sign", "--run", summary["run_id"], "--repo", str(demo)])
+    assert result.exit_code == 2
+    assert "outside the run directory" in result.stderr
+
+
+def test_record_sign_malformed_summary_is_runtime_error(demo: Path, keyfile: Path) -> None:
+    summary = plain_run(demo, "tests/test_text.py")
+    (run_dir_of(demo, summary) / "summary.json").write_text("[]", encoding="utf-8")
+    result = cli.invoke(app, ["record", "sign", "--run", summary["run_id"], "--repo", str(demo)])
+    assert result.exit_code == 3
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+
+
+def test_verify_rejects_internally_inconsistent_payload(
+    demo: Path, keyfile: Path, tmp_path: Path
+) -> None:
+    _, record_path = signed_run(demo)
+    doc = json.loads(record_path.read_text(encoding="utf-8"))
+    payload = doc["payload"]
+    payload["summary"]["passed"] = 999
+    key, _ = rec.load_private_key(keyfile)
+    forged = tmp_path / "forged.json"
+    forged.write_text(json.dumps(rec._envelope(payload, key)), encoding="utf-8")
+    code, out = verify(str(forged))
+    assert code == 4
+    assert out["reason"].startswith("payload is internally inconsistent")
+
+
+@pytest.mark.parametrize(
+    "make",
+    [
+        lambda d: d["payload"]["summary"].__setitem__("duration_ms", 2**53),
+        lambda d: d["payload"].__setitem__("timestamp", "\ud800"),
+    ],
+)
+def test_verify_garbage_payload_is_a_verdict(
+    demo: Path, keyfile: Path, tmp_path: Path, make: Any
+) -> None:
+    _, record_path = signed_run(demo)
+    doc = json.loads(record_path.read_text(encoding="utf-8"))
+    make(doc)
+    bad = tmp_path / "bad.json"
+    bad.write_text(json.dumps(doc), encoding="utf-8")
+    code, out = verify(str(bad))
+    assert code == 4 and out["valid"] is False
+
+
+def test_verify_deep_nesting_and_duplicates_are_verdicts(tmp_path: Path) -> None:
+    deep = tmp_path / "deep.json"
+    deep.write_text('{"payload": ' + "[" * 100_000 + "]" * 100_000 + "}", encoding="utf-8")
+    code, out = verify(str(deep))
+    assert code == 4 and out["valid"] is False
+    dup = tmp_path / "dup.json"
+    dup.write_text('{"payload": {"a": 1, "a": 2}, "signature": {}}', encoding="utf-8")
+    code, out = verify(str(dup))
+    assert code == 4 and "duplicate key" in out["reason"]
+
+
+def test_locally_excluded_file_changes_tree_and_dirty(demo: Path) -> None:
+    head_tree = git(demo, "rev-parse", "HEAD^{tree}")
+    (demo / "tests/test_hidden.py").write_text("def test_hidden():\n    pass\n", encoding="utf-8")
+    exclude = demo / ".git" / "info" / "exclude"
+    exclude.parent.mkdir(parents=True, exist_ok=True)
+    with exclude.open("a", encoding="utf-8") as fh:
+        fh.write("tests/test_hidden.py\n")
+    info = util.git_info(demo)
+    assert info.tree != head_tree
+    assert info.dirty is True
+    # In-tree .gitignore rules still exclude ignored files.
+    (demo / "ignored.log").write_text("x", encoding="utf-8")
+    with (demo / ".gitignore").open("a", encoding="utf-8") as fh:
+        fh.write("*.log\n")
+    git(demo, "add", ".gitignore")
+    git(demo, "commit", "-q", "-m", "ignore logs")
+    (demo / "tests/test_hidden.py").unlink()
+    assert util.git_info(demo).tree == git(demo, "rev-parse", "HEAD^{tree}")
+
+
+def test_run_sign_refuses_when_tests_modify_the_tree(demo: Path, keyfile: Path) -> None:
+    (demo / "tests/test_writer.py").write_text(
+        "from pathlib import Path\n\n"
+        "def test_writes():\n"
+        "    p = Path(__file__).parent.parent / 'README.md'\n"
+        "    p.write_text(p.read_text() + 'x', encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+    git(demo, "add", "-A")
+    git(demo, "commit", "-q", "-m", "writer")
+    result = cli.invoke(app, ["run", "tests/test_writer.py", "--sign", "--repo", str(demo)])
+    assert result.exit_code == 2
+    assert "no longer matches" in result.stderr
+    assert not list((demo / ".proof-ci" / "runs").glob("*/record.json"))
+
+
+@pytest.mark.parametrize("target", ["proof-ci.toml", ".git/config"])
+def test_record_out_refuses_tracked_and_git_dir(demo: Path, keyfile: Path, target: str) -> None:
+    before = (demo / target).read_bytes()
+    result = cli.invoke(
+        app,
+        [
+            "run",
+            "tests/test_text.py",
+            "--sign",
+            "--record-out",
+            str(demo / target),
+            "--repo",
+            str(demo),
+        ],
+    )
+    assert result.exit_code == 2
+    assert (demo / target).read_bytes() == before
+
+
+def test_failing_run_keeps_exit_1_when_signing_fails(
+    demo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("PROOF_CI_SIGNING_KEY", str(tmp_path / "missing.pem"))
+    result = cli.invoke(app, ["run", "tests/test_math.py", "--sign", "--repo", str(demo)])
+    assert result.exit_code == 1
+    assert "no signing key" in result.stderr
+
+
+def test_verify_reports_trust_source(demo: Path, keyfile: Path) -> None:
+    _, record_path = signed_run(demo)
+    code, out = verify(str(record_path), "--pubkey", str(keyfile) + ".pub")
+    assert out["trust_source"] == "--pubkey"
+    config = demo / "proof-ci.toml"
+    config.write_text(
+        config.read_text(encoding="utf-8")
+        + f"\n[record]\ntrusted_pubkeys = [{json.dumps(str(keyfile) + '.pub')}]\n",
+        encoding="utf-8",
+    )
+    result = cli.invoke(app, ["record", "verify", str(record_path), "--json", "--repo", str(demo)])
+    assert json.loads(result.stdout)["trust_source"].startswith("config:")
+    assert "out of band" in result.stderr

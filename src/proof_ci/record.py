@@ -19,10 +19,10 @@ import json
 import os
 import platform
 import re
-import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -39,7 +39,7 @@ from pydantic import ValidationError
 from proof_ci import __version__
 from proof_ci.adapters.agent.identity import Identity
 from proof_ci.config import Config, user_config_dir
-from proof_ci.models import RunRecord
+from proof_ci.models import RunRecord, RunSummary, TestResult
 from proof_ci.util import GitError, git_preflight, tree_hash
 
 __all__ = [
@@ -62,7 +62,6 @@ __all__ = [
 KEY_ENV = "PROOF_CI_SIGNING_KEY"
 KEY_FILENAME = "ed25519.pem"
 MODELESS_FS = ("drvfs", "9p", "cifs", "smbfs", "fuse", "nfs")
-UNSAFE_WINDOWS_PRINCIPALS = ("everyone", "users", "authenticated users", "builtin\\users")
 
 
 class KeyError_(Exception):
@@ -138,8 +137,35 @@ def _windows_user() -> str:
         raise KeyError_("cannot determine the current Windows user for the key ACL") from exc
 
 
+def _system32_tool(name: str) -> str | None:
+    """A Windows system tool by absolute path.
+
+    PATH lookup is not used: Git Bash and MSYS put a Unix ``whoami`` ahead of the
+    Windows one, which would silently disable the ACL check.
+    """
+    root = os.environ.get("SystemRoot") or os.environ.get("windir") or r"C:\Windows"
+    candidate = Path(root) / "System32" / f"{name}.exe"
+    return str(candidate) if candidate.is_file() else None
+
+
+def _current_user_sid() -> str | None:
+    """The current user's SID from ``whoami /user`` (locale-independent)."""
+    exe = _system32_tool("whoami")
+    if exe is None:
+        return None
+    proc = subprocess.run(
+        [exe, "/user", "/fo", "csv", "/nh"],
+        capture_output=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    match = re.search(r"\"(S-1-[0-9-]+)\"", proc.stdout)
+    return match.group(1) if match else None
+
+
 def _icacls() -> str | None:
-    return shutil.which("icacls")
+    return _system32_tool("icacls")
 
 
 def _protect_windows(path: Path) -> None:
@@ -149,8 +175,11 @@ def _protect_windows(path: Path) -> None:
             f"warning: icacls not found; {path} is not restricted to the current user\n"
         )
         return
+    sid = _current_user_sid()
+    # Grant by SID when known: a bare name can resolve to a same-named local account.
+    target = f"*{sid}" if sid else _windows_user()
     proc = subprocess.run(
-        [exe, str(path), "/inheritance:r", "/grant:r", f"{_windows_user()}:F"],
+        [exe, str(path), "/inheritance:r", "/grant:r", f"{target}:F"],
         capture_output=True,
         encoding="utf-8",
         errors="replace",
@@ -160,33 +189,67 @@ def _protect_windows(path: Path) -> None:
         raise KeyError_(f"icacls could not restrict {path}: {(proc.stderr or proc.stdout).strip()}")
 
 
+# SDDL aliases icacls may print instead of SIDs.
+_SDDL_ALIASES = {
+    "SY": "S-1-5-18",
+    "BA": "S-1-5-32-544",
+    "CO": "S-1-3-0",
+    "OW": "S-1-3-4",
+    "WD": "S-1-1-0",
+    "BU": "S-1-5-32-545",
+    "AU": "S-1-5-11",
+    "AN": "S-1-5-7",
+    "BG": "S-1-5-32-546",
+    "PU": "S-1-5-32-547",
+    "IU": "S-1-5-4",
+    "NU": "S-1-5-2",
+    "LS": "S-1-5-19",
+    "NS": "S-1-5-20",
+}
+# Allowed besides the current user: SYSTEM, Administrators, CREATOR OWNER, OWNER RIGHTS.
+_ALLOWED_SIDS = frozenset({"S-1-5-18", "S-1-5-32-544", "S-1-3-0", "S-1-3-4"})
+_ACE_RE = re.compile(r"\(([A-Z]+);[^;()]*;[^;()]*;[^;()]*;[^;()]*;([^;()]+)(?:;[^()]*)?\)")
+
+
+def _parse_sddl(sddl: str) -> list[tuple[str, str]]:
+    """(ace_type, sid) pairs from the DACL part of an SDDL string."""
+    dacl = sddl.split("D:", 1)[1] if "D:" in sddl else ""
+    dacl = dacl.split("S:", 1)[0]
+    return [(typ, _SDDL_ALIASES.get(sid, sid)) for typ, sid in _ACE_RE.findall(dacl)]
+
+
+def _unsafe_sids(aces: list[tuple[str, str]], user_sid: str) -> list[str]:
+    """Allow-list: any granting ACE for a SID other than the user/SYSTEM/Administrators."""
+    allowed = _ALLOWED_SIDS | {user_sid}
+    return sorted({sid for typ, sid in aces if typ in ("A", "OA") and sid not in allowed})
+
+
 def _windows_unsafe_principals(path: Path) -> list[str] | None:
-    """Principals other than the owner/SYSTEM/Administrators with access; None if unknown."""
+    """SIDs other than the owner/SYSTEM/Administrators with access; None if it cannot be read."""
     exe = _icacls()
-    if exe is None:
+    user_sid = _current_user_sid()
+    if exe is None or user_sid is None:
         return None
-    proc = subprocess.run(
-        [exe, str(path)], capture_output=True, encoding="utf-8", errors="replace", check=False
-    )
-    if proc.returncode != 0:
+    fd, tmp_name = tempfile.mkstemp(prefix="proof-ci-acl-")
+    os.close(fd)
+    tmp = Path(tmp_name)
+    try:
+        tmp.unlink()  # icacls /save refuses to overwrite in some versions
+        proc = subprocess.run(
+            [exe, str(path), "/save", str(tmp), "/q"],
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+        if proc.returncode != 0 or not tmp.exists():
+            return None
+        aces = _parse_sddl(tmp.read_bytes().decode("utf-16", errors="replace"))
+    finally:
+        tmp.unlink(missing_ok=True)
+    if not aces:
         return None
-    return _parse_icacls(proc.stdout, str(path))
-
-
-def _parse_icacls(output: str, path: str) -> list[str]:
-    bad: list[str] = []
-    for line in output.splitlines():
-        text = line.strip()
-        if text.lower().startswith(path.lower()):
-            text = text[len(path) :].strip()
-        match = re.match(r"^(.+?):\(", text)
-        if not match:
-            continue
-        principal = match.group(1).strip()
-        low = principal.lower()
-        if low in UNSAFE_WINDOWS_PRINCIPALS or low.endswith(("\\users", "\\authenticated users")):
-            bad.append(principal)
-    return bad
+    return _unsafe_sids(aces, user_sid)
 
 
 def _mount_fstype(path: Path) -> str | None:
@@ -250,7 +313,11 @@ def check_key_protection(path: Path) -> list[str]:
 
 
 def generate_keypair(path: Path, *, force: bool = False) -> Path:
-    """Create ``path`` (PKCS#8 PEM, owner-only) and ``path.pub`` (SPKI PEM)."""
+    """Create ``path`` (PKCS#8 PEM, owner-only) and ``path.pub`` (SPKI PEM).
+
+    The file is created empty, restricted, and only then filled, so a failure to
+    restrict it never leaves a readable private key behind.
+    """
     pub = path.with_name(path.name + ".pub")
     if path.exists() and not force:
         raise KeyError_(f"{path} already exists; use --force to replace it")
@@ -264,19 +331,23 @@ def generate_keypair(path: Path, *, force: bool = False) -> Path:
         serialization.NoEncryption(),
     )
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o600)
+    os.close(fd)
     try:
-        os.write(fd, pem)
-    finally:
-        os.close(fd)
-    if os.name == "nt":
-        _protect_windows(path)
-    else:
-        os.chmod(path, 0o600)
-    pub.write_bytes(
-        key.public_key().public_bytes(
-            serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo
+        if os.name == "nt":
+            _protect_windows(path)
+        else:
+            os.chmod(path, 0o600)
+        with path.open("wb") as fh:
+            fh.write(pem)
+        pub.write_bytes(
+            key.public_key().public_bytes(
+                serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo
+            )
         )
-    )
+    except BaseException:
+        path.unlink(missing_ok=True)
+        pub.unlink(missing_ok=True)
+        raise
     return pub
 
 
@@ -307,18 +378,101 @@ def load_public_key(path: Path) -> bytes:
 # ------------------------------------------------------------------- signing
 
 
+def _no_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in out:
+            raise ValueError(f"duplicate key {key!r}")
+        out[key] = value
+    return out
+
+
+def _load_json(text: str) -> Any:
+    """Strict JSON: duplicate keys are an error (RFC 8785 input must be duplicate-free)."""
+    return json.loads(text, object_pairs_hook=_no_duplicates)
+
+
 def _read_json(path: Path) -> Any:
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
-        raise SignError(f"cannot read {path}: {exc}") from exc
+        return _load_json(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, RecursionError) as exc:
+        raise SignError(f"cannot read {path}: {exc}", runtime=True) from exc
+
+
+_OUTCOME_KEYS = ("passed", "failed", "skipped", "error")
+
+
+def _tally(results: list[dict[str, Any]]) -> dict[str, int]:
+    tally = dict.fromkeys(_OUTCOME_KEYS, 0)
+    for r in results:
+        outcome = r.get("outcome")
+        if outcome in tally:
+            tally[outcome] += 1
+    return tally
+
+
+def _consistency_problem(payload: dict[str, Any]) -> str | None:
+    """Why a payload's summary disagrees with its own results, or None."""
+    results = payload.get("results")
+    summary = payload.get("summary")
+    if not isinstance(results, list) or not isinstance(summary, dict):
+        return "summary or results missing"
+    tally = _tally(results)
+    for key in _OUTCOME_KEYS:
+        if summary.get(key) != tally[key]:
+            return f"summary.{key} is {summary.get(key)} but results contain {tally[key]}"
+    replayed = sum(1 for r in results if isinstance(r, dict) and r.get("cache_hit"))
+    if summary.get("replayed") != replayed or summary.get("executed") != len(results) - replayed:
+        return "summary.executed/replayed do not match the results"
+    selection = payload.get("selection")
+    if isinstance(selection, dict) and selection.get("selected_count") != len(results):
+        return "selection.selected_count does not match the number of results"
+    blocking = [
+        r
+        for r in results
+        if r.get("outcome") in ("failed", "error")
+        and (r.get("flaky") or {}).get("status") not in ("confirmed", "ignored")
+    ]
+    outcome = summary.get("outcome")
+    if outcome == "passed" and blocking:
+        return "summary.outcome is passed but results contain failures that were not known flakes"
+    if outcome == "failed" and not any(r.get("outcome") == "failed" for r in results):
+        return "summary.outcome is failed but no result failed"
+    if outcome == "error" and not any(r.get("outcome") == "error" for r in results):
+        return "summary.outcome is error but no result errored"
+    return None
 
 
 def build_payload(cfg: Config, run_dir: Path, identity: Identity, *, tree: str) -> dict[str, Any]:
-    """Build the payload from a run's own artifacts. Never from caller-supplied JSON."""
-    summary = _read_json(run_dir / "summary.json")
-    results = _read_json(cfg.resolve(summary["results_path"]))
+    """Build the payload from a run's own artifacts. Never from caller-supplied JSON.
+
+    The artifacts live in the user's working copy, so they are validated and
+    cross-checked rather than trusted: the summary must parse as a RunSummary,
+    results must parse as TestResults, live inside the run directory, and agree
+    with the summary's counts and outcome.
+    """
+    raw_summary = _read_json(run_dir / "summary.json")
+    try:
+        summary = RunSummary.model_validate(raw_summary).to_json()
+    except ValidationError as exc:
+        raise SignError(
+            f"{run_dir / 'summary.json'} is not a valid RunSummary", runtime=True
+        ) from exc
+    results_path = cfg.resolve(summary["results_path"]).resolve()
+    try:
+        results_path.relative_to(run_dir.resolve())
+    except ValueError as exc:
+        raise SignError("results_path points outside the run directory; refusing to sign") from exc
+    raw_results = _read_json(results_path)
+    if not isinstance(raw_results, list):
+        raise SignError(f"{results_path} is not a list of results", runtime=True)
+    try:
+        results = [TestResult.model_validate(r).to_json() for r in raw_results]
+    except ValidationError as exc:
+        raise SignError(f"{results_path} contains an invalid TestResult", runtime=True) from exc
     environment = _read_json(run_dir / "environment.json")
+    if not isinstance(environment, dict) or not {"python", "platform"} <= set(environment):
+        raise SignError(f"{run_dir / 'environment.json'} is malformed", runtime=True)
     sel = dict(summary["selection"])
     if sel.get("selected_count", 0) == 0:
         raise SignError("cannot sign a run that selected no tests")
@@ -343,8 +497,8 @@ def build_payload(cfg: Config, run_dir: Path, identity: Identity, *, tree: str) 
         "selection": sel,
         "agent": identity.as_payload(),
         "environment": {
-            "python": environment["python"],
-            "platform": environment["platform"],
+            "python": str(environment["python"]),
+            "platform": str(environment["platform"]),
             "proof_ci_version": __version__,
             "os_release": platform.release(),
         },
@@ -363,11 +517,17 @@ def build_payload(cfg: Config, run_dir: Path, identity: Identity, *, tree: str) 
     }
     if summary.get("savings"):
         payload["savings"] = summary["savings"]
+    problem = _consistency_problem(payload)
+    if problem is not None:
+        raise SignError(f"the run's artifacts are inconsistent ({problem}); refusing to sign")
     return payload
 
 
 def _envelope(payload: dict[str, Any], key: Ed25519PrivateKey) -> dict[str, Any]:
-    canonical = canonical_bytes(payload)
+    try:
+        canonical = canonical_bytes(payload)
+    except ValueError as exc:  # rfc8785 domain errors (e.g. integers beyond 2**53)
+        raise SignError(f"payload cannot be canonicalised: {exc}", runtime=True) from exc
     raw = _raw_public(key.public_key())
     return {
         "payload": payload,
@@ -393,35 +553,39 @@ def sign_run(
     identity: Identity,
     key_path: Path,
     output: Path,
-    *,
-    recheck_tree: bool,
 ) -> SignOutcome:
     """Sign the run in ``run_dir`` (a directory ``proof-ci run`` wrote).
 
-    With ``recheck_tree`` (``record sign``) the working tree is re-hashed and
-    must equal the tree the run recorded; ``run --sign`` signs the tree it just
-    tested.
+    The working tree is re-hashed at signing time and must equal the tree the
+    run recorded, both for ``run --sign`` (tests may have modified files) and
+    for ``record sign`` (the user may have edited files since). ``record sign``
+    re-signs artifacts stored in the working copy, which the same user can edit;
+    it is therefore weaker than ``run --sign``.
     """
     if not (run_dir / "summary.json").is_file():
         raise SignError(f"no proof-ci run at {run_dir}")
-    summary = _read_json(run_dir / "summary.json")
-    if summary["selection"].get("selected_count", 0) == 0:
+    raw = _read_json(run_dir / "summary.json")
+    selection = raw.get("selection") if isinstance(raw, dict) else None
+    if not isinstance(selection, dict):
+        raise SignError(f"{run_dir / 'summary.json'} is not a valid RunSummary", runtime=True)
+    if selection.get("selected_count", 0) == 0:
         raise SignError("cannot sign a run that selected no tests")
-    recorded = summary.get("commit_tree")
-    try:
-        git_preflight(cfg.repo_root)
-        current = tree_hash(cfg.repo_root) if recheck_tree or not recorded else recorded
-    except GitError as exc:
-        raise SignError(str(exc), runtime=True) from exc
+    recorded = raw.get("commit_tree")
     if not recorded:
         raise SignError("the run recorded no tree hash (git was unavailable)", runtime=True)
-    if recheck_tree and current != recorded:
+    try:
+        git_preflight(cfg.repo_root)
+        current = tree_hash(cfg.repo_root)
+    except GitError as exc:
+        raise SignError(str(exc), runtime=True) from exc
+    if current != recorded:
         raise SignError(
-            "the working tree changed since this run (tree "
-            f"{recorded[:12]} -> {current[:12]}); rerun instead of signing a stale result"
+            "the working tree no longer matches the tree this run tested (tree "
+            f"{str(recorded)[:12]} -> {current[:12]}; tests or edits changed files); "
+            "rerun instead of signing a stale result"
         )
     key, warnings = load_private_key(key_path)
-    payload = build_payload(cfg, run_dir, identity, tree=recorded)
+    payload = build_payload(cfg, run_dir, identity, tree=str(recorded))
     envelope = _envelope(payload, key)
     try:
         RunRecord.model_validate(envelope)
@@ -497,11 +661,18 @@ def _b64(value: Any) -> bytes | None:
 def verify_record(
     path: Path, trusted: list[bytes], *, require_known_key: bool = False
 ) -> VerifyResult:
-    """Verify a record file (read-only). ``trusted`` holds raw 32-byte public keys."""
+    """Verify a record file (read-only). ``trusted`` holds raw 32-byte public keys.
+
+    Always returns a verdict; malformed input is an invalid record, never a crash.
+    """
     try:
-        doc = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
+        doc = _load_json(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError) as exc:
         return VerifyResult(False, f"cannot read record: {exc}")
+    except RecursionError:
+        return VerifyResult(False, "record is nested too deeply")
+    except ValueError as exc:
+        return VerifyResult(False, f"record is not valid JSON: {exc}")
     if not isinstance(doc, dict) or "payload" not in doc:
         return VerifyResult(False, "missing payload")
     sig = doc.get("signature")
@@ -533,6 +704,8 @@ def verify_record(
         canonical = canonical_bytes(payload)
     except SignError:
         return VerifyResult(False, "payload contains a floating-point number")
+    except (ValueError, RecursionError):
+        return VerifyResult(False, "payload cannot be canonicalised")
     try:
         Ed25519PublicKey.from_public_bytes(raw).verify(value, canonical)
     except (InvalidSignature, ValueError):
@@ -541,6 +714,9 @@ def verify_record(
         RunRecord.model_validate(doc)
     except ValidationError:
         return VerifyResult(False, "payload does not match schema")
+    problem = _consistency_problem(payload)
+    if problem is not None:
+        return VerifyResult(False, f"payload is internally inconsistent: {problem}")
     note = (
         None
         if known

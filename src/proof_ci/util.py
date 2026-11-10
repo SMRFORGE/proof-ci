@@ -44,7 +44,11 @@ def utc_now_iso() -> str:
 
 
 def run_git(
-    repo: Path, *args: str, env: dict[str, str] | None = None, check: bool = True
+    repo: Path,
+    *args: str,
+    env: dict[str, str] | None = None,
+    check: bool = True,
+    stdin: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
     exe = shutil.which("git")
     if exe is None:
@@ -58,6 +62,7 @@ def run_git(
             errors="replace",
             env=env,
             check=False,
+            input=stdin,
         )
     except OSError as exc:
         raise GitError(f"cannot run git: {exc}") from exc
@@ -102,6 +107,20 @@ def tree_hash(repo: Path) -> str:
             tmp.unlink()  # git creates a fresh index when the file is absent
         env = {**os.environ, "GIT_INDEX_FILE": str(tmp)}
         run_git(repo, "add", "-A", env=env)
+        # `add -A` honours .git/info/exclude and core.excludesFile, which are local
+        # to this machine. A file hidden that way could change test outcomes while
+        # the record claims the committed tree, so untracked files are also added
+        # by the in-tree .gitignore rules alone (proof-ci's own state excepted).
+        extra = run_git(
+            repo, "ls-files", "-z", "--others", "--exclude-per-directory=.gitignore", env=env
+        ).stdout
+        paths = [
+            p
+            for p in extra.split("\0")
+            if p and not p.endswith("/") and not (p == ".proof-ci" or p.startswith(".proof-ci/"))
+        ]
+        if paths:
+            run_git(repo, "update-index", "--add", "-z", "--stdin", env=env, stdin="\0".join(paths))
         return run_git(repo, "write-tree", env=env).stdout.strip()
     finally:
         tmp.unlink(missing_ok=True)
@@ -124,9 +143,12 @@ def git_info(repo: Path) -> GitInfo:
         return GitInfo(None, None, None)
     head = run_git(repo, "rev-parse", "--verify", "-q", "HEAD", check=False)
     sha = head.stdout.strip() if head.returncode == 0 else None
-    status = run_git(repo, "status", "--porcelain", "--untracked-files=normal")
-    dirty = bool(status.stdout.strip())
-    return GitInfo(sha=sha, tree=tree_hash(repo), dirty=dirty)
+    tree = tree_hash(repo)
+    # Dirty means "the tree as tested differs from HEAD's tree", by the same rules
+    # as the tree hash (not `git status`, which honours machine-local excludes).
+    head_tree = run_git(repo, "rev-parse", "--verify", "-q", "HEAD^{tree}", check=False)
+    dirty = head_tree.returncode != 0 or head_tree.stdout.strip() != tree
+    return GitInfo(sha=sha, tree=tree, dirty=dirty)
 
 
 class CaseIndex:
