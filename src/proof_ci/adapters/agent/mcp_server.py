@@ -11,11 +11,10 @@ from __future__ import annotations
 import json
 import os
 import uuid
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-__all__ = ["TOOLS", "ToolError", "call_tool", "serve", "tool_definitions"]
+__all__ = ["TOOLS", "ToolError", "call_tool", "serve", "set_defaults", "tool_definitions"]
 
 SERVER_NAME = "proof-ci"
 
@@ -173,12 +172,22 @@ TOOLS: list[dict[str, Any]] = [
 # ---------------------------------------------------------------- helpers
 
 
+_DEFAULTS: dict[str, Path | None] = {"repo": None, "config": None}
+
+
+def set_defaults(*, repo: Path | None, config: Path | None) -> None:
+    """Server-wide defaults from ``proof-ci mcp --repo/--config``; a tool's ``repo`` wins."""
+    _DEFAULTS["repo"] = repo
+    _DEFAULTS["config"] = config
+
+
 def _config(args: dict[str, Any]) -> Any:
     from proof_ci.config import ConfigError, load_config
 
-    repo = args.get("repo")
+    repo = Path(args["repo"]) if args.get("repo") else _DEFAULTS["repo"]
+    config = None if args.get("repo") else _DEFAULTS["config"]
     try:
-        return load_config(Path(repo) if repo else None)
+        return load_config(repo, config)
     except ConfigError as exc:
         raise ToolError(str(exc)) from exc
 
@@ -248,22 +257,30 @@ def _run_affected_tests(args: dict[str, Any]) -> dict[str, Any]:
     except (ConfigError, RunError) as exc:
         raise ToolError(str(exc)) from exc
     summary = outcome.summary
+    sign_error: str | None = None
+    warnings: list[str] = []
     if args.get("sign"):
         if summary.selection.selected_count == 0:
+            # Spec 5.8 Step 7: a zero-test run is never signed, and the tool says so.
             raise ToolError(
                 f"cannot sign run {summary.run_id}: it selected no tests (nothing was checked)"
             )
-        from proof_ci.cli import _attach_record, _record_output, _sign, _SignFailure
+        from proof_ci.signing import SignFailure, sign_and_attach
 
         try:
-            assert outcome.run_dir is not None
-            out = _record_output(cfg, outcome.run_dir, None)
-            signed = _sign(cfg, outcome.run_dir, args.get("agent_id"), None, out)
-            summary = _attach_record(cfg, outcome.run_dir, summary, signed)
-        except _SignFailure as exc:
-            raise ToolError(
-                f"run {summary.run_id} finished but was not signed: {exc.message}"
-            ) from exc
+            signed = sign_and_attach(cfg, outcome.run_dir, summary, agent_id=args.get("agent_id"))
+            summary = signed.summary
+            warnings = signed.warnings
+        except SignFailure as exc:
+            # The tests ran: return their results, and say why there is no record.
+            sign_error = exc.message
+    # The CLI prints these on stderr. MCP has one RunSummary (no extra fields allowed by
+    # the contract), so they are appended to its free-text `summary` instead.
+    extra = [*outcome.notes, *warnings]
+    if sign_error is not None:
+        extra.append(f"not signed: {sign_error}")
+    if extra:
+        summary = summary.model_copy(update={"summary": "; ".join([summary.summary, *extra])})
     data: dict[str, Any] = summary.to_json()
     return data
 
@@ -273,17 +290,9 @@ def _get_failure_details(args: dict[str, Any]) -> dict[str, Any]:
 
 
 def _list_flaky_tests(args: dict[str, Any]) -> dict[str, Any]:
-    from proof_ci.runner import _flake_store
+    from proof_ci.flakes import flake_store, statuses_for
 
-    status = args.get("status")
-    statuses: tuple[str, ...]
-    if status is None:
-        statuses = ("suspected", "confirmed")
-    elif status == "all":
-        statuses = ("suspected", "confirmed", "ignored")
-    else:
-        statuses = (status,)
-    records = _flake_store(_config(args)).list_records(statuses)
+    records = flake_store(_config(args)).list_records(statuses_for(args.get("status")))
     return {"flakes": [r.to_json() for r in records]}
 
 
@@ -299,7 +308,8 @@ def _verify_record(args: dict[str, Any]) -> dict[str, Any]:
             source = "pubkey"
         else:
             try:
-                cfg = load_config(Path(args["repo"]) if args.get("repo") else None)
+                repo = Path(args["repo"]) if args.get("repo") else _DEFAULTS["repo"]
+                cfg = load_config(repo, None if args.get("repo") else _DEFAULTS["config"])
                 trusted = [load_public_key(cfg.resolve(p)) for p in cfg.record.trusted_pubkeys]
                 if trusted:
                     source = f"config:{cfg.config_path.as_posix()}"
@@ -323,26 +333,42 @@ def _explain_failure(args: dict[str, Any]) -> dict[str, Any]:
     status = str(flaky.get("status", "none"))
     is_flaky = bool(flaky.get("is_flaky"))
     cause = failure.get("likely_cause")
-    where = f"{failure.get('file') or r['location']['file']}:{failure.get('line') or r['location']['line']}"
-    if r["outcome"] in ("failed", "error"):
-        first = (failure.get("error_message") or "").splitlines()[:1]
-        summary = (
-            f"{r['test_id']} {r['outcome']} at {where} with {failure.get('error_type', 'an error')}"
-        )
-        if first and first[0]:
-            summary += f": {first[0]}"
-    else:
-        summary = f"{r['test_id']} {r['outcome']}; there is no failure to explain."
     repro = failure.get("repro_command") or _repro(r["test_id"])
+    if r["outcome"] not in ("failed", "error"):
+        return {
+            "test_id": r["test_id"],
+            "outcome": r["outcome"],
+            "summary": f"{r['test_id']} {r['outcome']}; there is no failure to explain.",
+            "likely_cause": None,
+            "repro_command": repro,
+            "is_flaky": is_flaky,
+            "flake_status": status,
+            "related_diff": None,
+            "next_steps": [f"Rerun with the repro command to confirm: {repro}"],
+        }
+    # Same rule as the run summary: the failure's own file and line, else the test's.
+    if failure.get("file"):
+        where = f"{failure['file']}:{failure.get('line') or '?'}"
+    else:
+        where = f"{r['location']['file']}:{r['location']['line']}"
+    first = (failure.get("error_message") or "").splitlines()[:1]
+    summary = (
+        f"{r['test_id']} {r['outcome']} at {where} with {failure.get('error_type', 'an error')}"
+    )
+    if first and first[0]:
+        summary += f": {first[0]}"
     steps: list[str] = []
     if is_flaky and status in ("confirmed", "ignored"):
         steps.append(
             "This test is a known flake: do not rewrite production code only to satisfy it. "
             "Rerun it once; if it passes, ignore it or mark it with `proof-ci flakes mark`."
         )
+    elif status == "suspected":
+        steps.append("This test is a suspected flake; treat the failure as real until confirmed.")
     if cause:
         steps.append(
-            f"Inspect {cause.get('file')}:{cause.get('line')} first; the failure passes through code changed in this diff."
+            f"Inspect {cause.get('file')}:{cause.get('line')} first; the failure passes through "
+            "code changed in this diff."
         )
     else:
         steps.append(
@@ -370,27 +396,19 @@ def _repro(test_id: str) -> str:
 
 
 def _get_savings_report(args: dict[str, Any]) -> dict[str, Any]:
-    from proof_ci.savings import SavingsLedger, build_report, parse_when
+    from proof_ci.savings import report_for
 
     cfg = _config(args)
-    by = args.get("by") or "repo"
     try:
-        start = parse_when(args.get("since") or "30d")
-        end = parse_when(args["until"]) if args.get("until") else datetime.now(UTC)
+        report = report_for(
+            cfg,
+            since=args.get("since"),
+            until=args.get("until"),
+            by=args.get("by") or "repo",
+            weekly=bool(args.get("weekly")),
+        )
     except ValueError as exc:
         raise ToolError(str(exc)) from exc
-    fmt = "%Y-%m-%dT%H:%M:%S.%f"
-    rows = SavingsLedger(cfg.resolve(cfg.savings.db)).rows(
-        start.strftime(fmt)[:-3] + "Z", end.strftime(fmt)[:-3] + "Z"
-    )
-    report = build_report(
-        rows,
-        since=start,
-        until=end,
-        group_by=by,  # type: ignore[arg-type]
-        weekly=bool(args.get("weekly")),
-        repo_name=cfg.project_name,
-    )
     data: dict[str, Any] = report.to_json()
     return data
 

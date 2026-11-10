@@ -50,7 +50,7 @@ from proof_ci.cache import (
     trim_caches,
 )
 from proof_ci.config import Config, ConfigError
-from proof_ci.flakes import FlakeStore, code_hash
+from proof_ci.flakes import code_hash, flake_store
 from proof_ci.models import (
     CacheStats,
     Counts,
@@ -62,7 +62,16 @@ from proof_ci.models import (
 )
 from proof_ci.redact import redact
 from proof_ci.savings import RunFacts, SavingsLedger, compute_savings, ledger_row
-from proof_ci.util import CaseIndex, GitError, GitInfo, debug, git_info, run_git, utc_now_iso
+from proof_ci.util import (
+    CaseIndex,
+    GitError,
+    GitInfo,
+    debug,
+    git_info,
+    run_git,
+    utc_now_iso,
+    write_json_atomic,
+)
 
 __all__ = [
     "RunError",
@@ -101,9 +110,9 @@ class RunOutcome:
     results: list[TestResult]
     exit_code: int
     pytest_stdout: str
+    run_dir: Path
+    savings: Savings
     notes: list[str] = field(default_factory=list)
-    run_dir: Path | None = None
-    savings: Savings | None = None
 
 
 def _require_pytest_command(cfg: Config) -> None:
@@ -213,10 +222,7 @@ def _rel(cfg: Config, path: Path) -> str:
 
 
 def _write_json(path: Path, data: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8", newline="\n") as fh:
-        json.dump(data, fh, ensure_ascii=False, indent=2)
-        fh.write("\n")
+    write_json_atomic(path, data)
 
 
 # ------------------------------------------------------------------ selection
@@ -448,15 +454,6 @@ def compute_affected(cfg: Config, base: str | None) -> SelectionPlan:
         raise RunError(str(exc)) from exc
 
 
-def _flake_store(cfg: Config) -> FlakeStore:
-    return FlakeStore(
-        cfg.resolve(cfg.flakes.db),
-        min_runs=cfg.flakes.min_runs,
-        window_days=cfg.flakes.window_days,
-        min_flips_confirmed=cfg.flakes.min_flips_confirmed,
-    )
-
-
 def _check_run(out: RunOutput, ids: list[str], case: CaseIndex) -> None:
     # pytest exit codes 2 (interrupted), 3 (internal error), 4 (usage error):
     # whatever results exist are partial, so do not present them as a run.
@@ -656,7 +653,7 @@ def execute_run(cfg: Config, options: RunOptions) -> RunOutcome:
     result_cache = ResultCache(cfg.resolve(cfg.cache.dir))
     # Keys also give each test its code_hash for the flake store.
     keys = _KeyBuilder(cfg, plan) if plan.selected else None
-    store = _flake_store(cfg)
+    store = flake_store(cfg)
     flakes_before = store.snapshot()
     env = plan.env
     base_ref = plan.base.base_ref if plan.base else ""

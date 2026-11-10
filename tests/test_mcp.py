@@ -64,9 +64,9 @@ def test_explain_failure_rules(demo: Path) -> None:
     assert out["next_steps"][-1].startswith("Rerun with the repro command to confirm")
 
     from proof_ci.config import load_config
-    from proof_ci.runner import _flake_store
+    from proof_ci.flakes import flake_store
 
-    _flake_store(load_config(demo)).mark(
+    flake_store(load_config(demo)).mark(
         "tests/test_math.py::test_div_wrong_expectation", "confirmed", None
     )
     run(demo, tests=["tests/test_math.py"])
@@ -105,3 +105,41 @@ def test_verify_record_tool(demo: Path, tmp_path: Path, monkeypatch: pytest.Monk
     bad.write_text("{}", encoding="utf-8")
     out = call_tool("verify_record", {"repo": str(demo), "path": str(bad)})
     assert out == {"valid": False, "reason": "missing payload"}
+
+
+def test_explain_passing_test_has_no_failure_advice(demo: Path) -> None:
+    run(demo, tests=["tests/test_text.py"])
+    out = call_tool(
+        "explain_failure", {"repo": str(demo), "test_id": "tests/test_text.py::test_words"}
+    )
+    assert out["likely_cause"] is None
+    assert len(out["next_steps"]) == 1
+    assert out["next_steps"][0].startswith("Rerun with the repro command")
+
+
+def test_run_returns_notes(demo: Path) -> None:
+    run(demo, tests=["tests/test_text.py"])
+    out = run(demo, failed=True)
+    assert out["selection"]["selected_count"] == 0
+    assert "nothing to rerun" in out["summary"]
+
+
+def test_sign_failure_still_returns_the_run(
+    demo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("PROOF_CI_SIGNING_KEY", str(tmp_path / "missing.pem"))
+    out = run(demo, tests=["tests/test_text.py"], sign=True)
+    assert out["counts"]["passed"] == 2
+    assert out["record_path"] is None
+    assert "not signed:" in out["summary"]
+
+
+def test_server_defaults_apply_without_repo_argument(demo: Path) -> None:
+    from proof_ci.adapters.agent import mcp_server
+
+    mcp_server.set_defaults(repo=demo, config=None)
+    try:
+        out = call_tool("run_affected_tests", {"tests": ["tests/test_text.py"]})
+        assert out["counts"]["passed"] == 2
+    finally:
+        mcp_server.set_defaults(repo=None, config=None)

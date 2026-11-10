@@ -55,10 +55,15 @@ def test_adapters_may_import_vendor_sdks(tmp_path: Path) -> None:
 
 
 def test_mcp_only_in_agent_adapter() -> None:
-    users = sorted(
-        p.relative_to(SRC).as_posix()
-        for p in SRC.rglob("*.py")
-        if "from mcp" in p.read_text(encoding="utf-8")
-        or "import mcp" in p.read_text(encoding="utf-8")
-    )
-    assert users == ["adapters/agent/mcp_server.py"]
+    users = []
+    for path in sorted(SRC.rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            names = []
+            if isinstance(node, ast.Import):
+                names = [a.name for a in node.names]
+            elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
+                names = [node.module]
+            if any(n.split(".")[0] == "mcp" for n in names):
+                users.append(path.relative_to(SRC).as_posix())
+    assert sorted(set(users)) == ["adapters/agent/mcp_server.py"]

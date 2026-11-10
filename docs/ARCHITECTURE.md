@@ -19,11 +19,13 @@ flowchart TB
     RUNNER --> CACHE[cache.py: collection + result cache]
     RUNNER --> FLK[flakes.py: SQLite history]
     RUNNER --> SAV[savings.py: estimates + ledger]
-    CLI --> REC[record.py: sign / verify]
+    CLI --> SIGN[signing.py: sign a run, attach the record]
+    SIGN --> REC[record.py: keys, sign, verify]
     RUNNER --> UTIL[util.py: git, tree hash, case]
     MODELS[models.py + schemas/: data contracts]
   end
-  AG --> CLI
+  AG --> RUNNER
+  AG --> SIGN
   RUNNER --> RN
   CLI --> CI
 ```
@@ -39,6 +41,7 @@ flowchart TB
 | `cache.py` | Collection cache and result cache (RFC 8785 + SHA-256 keys), LRU trim |
 | `flakes.py` | Outcome history, flake detection and transitions, manual marks |
 | `savings.py` | Calibration, per-run Savings object, ledger, reports |
+| `signing.py` | Sign a finished run and attach the record (shared by the CLI and MCP) |
 | `record.py` | Canonicalisation, Ed25519 keys and protection, sign, verify |
 | `discover.py` | Facade over CI command sources |
 | `pytest_plugin.py` | Loaded with `-p` inside pytest; stdlib + pytest only |

@@ -362,12 +362,17 @@ def run(
         # A green record must mean at least one test was checked (Section 5.8 Step 7).
         if summary.selection.selected_count == 0:
             sign_refused = ("cannot sign a run that selected no tests", EXIT_USAGE)
-        elif outcome.run_dir is not None:
+        else:
+            from proof_ci.signing import SignFailure, sign_and_attach
+
             try:
-                out = _record_output(cfg, outcome.run_dir, record_out)
-                signed = _sign(cfg, outcome.run_dir, agent_id, None, out)
-                summary = _attach_record(cfg, outcome.run_dir, summary, signed)
-            except _SignFailure as exc:
+                signed = sign_and_attach(
+                    cfg, outcome.run_dir, summary, agent_id=agent_id, record_out=record_out
+                )
+                summary = signed.summary
+                for message in signed.warnings:
+                    _warn(message)
+            except SignFailure as exc:
                 sign_refused = (exc.message, exc.code)
 
     if common.json_output:
@@ -470,17 +475,15 @@ flakes_app = typer.Typer(
 )
 app.add_typer(flakes_app, name="flakes")
 
-_FLAKE_STATUSES = ("suspected", "confirmed", "resolved", "ignored")
-
 
 def _store_for(common: CommonOptions) -> Any:
-    from proof_ci.runner import _flake_store
+    from proof_ci.flakes import flake_store
 
     try:
         cfg = load_config(common.repo, common.config)
     except ConfigError as exc:
         raise _fail(str(exc), EXIT_USAGE) from exc
-    return _flake_store(cfg)
+    return flake_store(cfg)
 
 
 def _print_flake(record: Any) -> None:
@@ -506,14 +509,12 @@ def flakes_list(
     common: CommonOptions,
 ) -> None:
     """List flake records."""
-    if status is None:
-        statuses: tuple[str, ...] = ("suspected", "confirmed")
-    elif status == "all":
-        statuses = ("suspected", "confirmed", "ignored")
-    elif status in _FLAKE_STATUSES:
-        statuses = (status,)
-    else:
-        raise _fail(f"unknown --status {status!r}", EXIT_USAGE)
+    from proof_ci.flakes import statuses_for
+
+    try:
+        statuses = statuses_for(status)
+    except ValueError as exc:
+        raise _fail(f"unknown --status {status!r}", EXIT_USAGE) from exc
     records = _store_for(common).list_records(statuses)
     if common.json_output:
         emit_json({"flakes": [r.to_json() for r in records]})
@@ -579,104 +580,6 @@ def flakes_unmark(
 
 
 # ----------------------------------------------------------------- records
-
-
-class _SignFailure(Exception):
-    def __init__(self, message: str, code: int) -> None:
-        super().__init__(message)
-        self.message = message
-        self.code = code
-
-
-def _record_output(cfg: Any, run_dir: Path, requested: Path | None) -> Path:
-    """Default ``<run_dir>/record.json``; an explicit path must stay inside the repo."""
-    if requested is None:
-        return run_dir / "record.json"
-    target = requested if requested.is_absolute() else Path.cwd() / requested
-    target = target.resolve()
-    root = cfg.repo_root.resolve()
-    try:
-        rel = target.relative_to(root)
-    except ValueError as exc:
-        raise _SignFailure(f"{requested} resolves outside the repository", EXIT_USAGE) from exc
-    state = root / ".proof-ci"
-    if (target == state or state in target.parents) and (state / "runs") not in target.parents:
-        raise _SignFailure(
-            f"{requested} would overwrite proof-ci's own state; use .proof-ci/runs/<run_id>/",
-            EXIT_USAGE,
-        )
-    from proof_ci.util import GitError, run_git
-
-    try:
-        for flag in ("--git-dir", "--git-common-dir"):
-            out = run_git(root, "rev-parse", flag, check=False)
-            if out.returncode == 0 and out.stdout.strip():
-                git_dir = Path(out.stdout.strip())
-                git_dir = (git_dir if git_dir.is_absolute() else root / git_dir).resolve()
-                if target == git_dir or git_dir in target.parents:
-                    raise _SignFailure(f"{requested} is inside the git directory", EXIT_USAGE)
-        tracked = run_git(root, "ls-files", "--error-unmatch", "--", rel.as_posix(), check=False)
-        if tracked.returncode == 0:
-            raise _SignFailure(
-                f"{requested} is a tracked file; refusing to overwrite it", EXIT_USAGE
-            )
-    except GitError:
-        pass
-    return target
-
-
-def _sign(
-    cfg: Any,
-    run_dir: Path,
-    agent_id: str | None,
-    key: Path | None,
-    output: Path,
-) -> Any:
-    import os
-
-    from proof_ci.adapters.agent.identity import resolve_identity
-    from proof_ci.record import KeyError_, SignError, resolve_key_path, sign_run
-
-    identity = resolve_identity(agent_id, cfg.record.agent_id, os.environ)
-    if identity.defaulted:
-        _warn("no agent id given; using 'local' (set --agent-id or PROOF_CI_AGENT_ID)")
-    try:
-        result = sign_run(
-            cfg,
-            run_dir,
-            identity,
-            resolve_key_path(cfg, key),
-            output,
-        )
-    except SignError as exc:
-        raise _SignFailure(str(exc), EXIT_RUNTIME if exc.runtime else EXIT_USAGE) from exc
-    except KeyError_ as exc:
-        raise _SignFailure(str(exc), EXIT_USAGE) from exc
-    for message in result.warnings:
-        _warn(message)
-    return result
-
-
-def _attach_record(cfg: Any, run_dir: Path, summary: Any, signed: Any) -> Any:
-    from proof_ci.runner import _rel, _write_json
-
-    try:
-        record_path = _rel(cfg, signed.path)
-    except ValueError:
-        record_path = signed.path.as_posix()
-    updated = summary.model_copy(update={"record_path": record_path})
-    from proof_ci.savings import SavingsLedger
-
-    SavingsLedger(cfg.resolve(cfg.savings.db)).set_record_path(str(summary.run_id), record_path)
-    _write_json(run_dir / "summary.json", updated.to_json())
-    last = cfg.repo_root / ".proof-ci" / "last-run.json"
-    if last.is_file():
-        try:
-            if json.loads(last.read_text(encoding="utf-8")).get("run_id") == str(summary.run_id):
-                _write_json(last, updated.to_json())
-        except ValueError:
-            pass
-    return updated
 
 
 record_app = typer.Typer(
@@ -750,27 +653,33 @@ def record_sign(
         raise _fail(f"--run {run_id!r} is not a run id", EXIT_USAGE) from exc
     if not (run_dir / "summary.json").is_file():
         raise _fail(f"no run directory for {run_id}", EXIT_USAGE)
-    try:
-        out = _record_output(cfg, run_dir, output)
-        signed = _sign(cfg, run_dir, agent_id, key, out)
-    except _SignFailure as exc:
-        raise _fail(exc.message, exc.code) from exc
     from proof_ci.models import RunSummary
+    from proof_ci.signing import SignFailure, sign_and_attach
 
-    summary = RunSummary.model_validate(
-        json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
-    )
-    _attach_record(cfg, run_dir, summary, signed)
+    try:
+        summary = RunSummary.model_validate(
+            json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
+        )
+    except ValueError as exc:
+        raise _fail(f"{run_dir / 'summary.json'} is not a valid RunSummary", EXIT_RUNTIME) from exc
+    try:
+        signed = sign_and_attach(
+            cfg, run_dir, summary, agent_id=agent_id, key=key, record_out=output
+        )
+    except SignFailure as exc:
+        raise _fail(exc.message, exc.code) from exc
+    for message in signed.warnings:
+        _warn(message)
     if common.json_output:
         emit_json(
             {
-                "record_path": signed.path.as_posix(),
+                "record_path": signed.record_path.as_posix(),
                 "run_id": run_id,
-                "key_id": signed.record["signature"]["key_id"],
+                "key_id": signed.key_id,
             }
         )
     else:
-        typer.echo(f"Signed {signed.path} (key {signed.record['signature']['key_id']})")
+        typer.echo(f"Signed {signed.record_path} (key {signed.key_id})")
 
 
 @record_app.command("verify")
@@ -881,36 +790,13 @@ def savings_report(
     """Summarise the local savings ledger as a SavingsReport."""
     if ctx.invoked_subcommand is not None:
         return
-    from datetime import UTC, datetime
+    from proof_ci.savings import report_for
 
-    from proof_ci.savings import SavingsLedger, build_report, parse_when
-
-    if by not in ("repo", "agent", "branch"):
-        raise _fail("--by must be repo, agent, or branch", EXIT_USAGE)
-    try:
-        start = parse_when(since)
-        end = parse_when(until) if until else datetime.now(UTC)
-    except ValueError as exc:
-        raise _fail(str(exc), EXIT_USAGE) from exc
     try:
         cfg = load_config(common.repo, common.config)
-    except ConfigError as exc:
+        report = report_for(cfg, since=since, until=until, by=by, weekly=weekly)
+    except (ConfigError, ValueError) as exc:
         raise _fail(str(exc), EXIT_USAGE) from exc
-    fmt = "%Y-%m-%dT%H:%M:%S.%f"
-    try:
-        rows = SavingsLedger(cfg.resolve(cfg.savings.db)).rows(
-            start.strftime(fmt)[:-3] + "Z", end.strftime(fmt)[:-3] + "Z"
-        )
-    except Exception as exc:  # sqlite errors: the ledger cannot be read
-        raise _fail(f"cannot read the savings ledger: {exc}", EXIT_RUNTIME) from exc
-    report = build_report(
-        rows,
-        since=start,
-        until=end,
-        group_by=by,  # type: ignore[arg-type]
-        weekly=weekly,
-        repo_name=cfg.project_name,
-    )
     if common.json_output:
         emit_json(report.to_json())
         return
@@ -946,8 +832,8 @@ def savings_calibrate(*, common: CommonOptions) -> None:
         raise _fail(str(exc), EXIT_RUNTIME) from exc
     savings = outcome.savings
     if common.json_output:
-        emit_json(savings.to_json() if savings else {})
-    elif savings is not None:
+        emit_json(savings.to_json())
+    else:
         cal = savings.calibration
         typer.echo(outcome.summary.summary)
         typer.echo(
@@ -995,11 +881,17 @@ def discover_cmd(*, common: CommonOptions) -> None:
 
 
 @app.command("mcp")
-def mcp_cmd() -> None:
-    """Start the MCP server on stdio (no TCP port; stdout is the MCP transport)."""
+@common_options
+def mcp_cmd(*, common: CommonOptions) -> None:
+    """Start the MCP server on stdio (no TCP port; stdout is the MCP transport).
+
+    ``--repo`` / ``--config`` set the server's defaults for clients that cannot choose
+    the working directory; a tool call's own ``repo`` argument still wins.
+    """
     import anyio
 
-    from proof_ci.adapters.agent.mcp_server import serve
+    from proof_ci.adapters.agent import mcp_server
 
+    mcp_server.set_defaults(repo=common.repo, config=common.config)
     typer.echo("proof-ci MCP server starting on stdio", err=True)
-    anyio.run(serve)
+    anyio.run(mcp_server.serve)

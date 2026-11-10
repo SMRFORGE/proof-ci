@@ -26,6 +26,7 @@ __all__ = [
     "run_git",
     "tree_hash",
     "utc_now_iso",
+    "write_json_atomic",
 ]
 
 
@@ -37,6 +38,19 @@ def debug(message: str) -> None:
     """Write a diagnostic line to stderr when ``PROOF_CI_DEBUG=1``."""
     if os.environ.get("PROOF_CI_DEBUG") == "1":
         sys.stderr.write(f"proof-ci debug: {message}\n")
+
+
+def write_json_atomic(path: Path, data: object) -> None:
+    """Write JSON (UTF-8, 2-space indent, trailing newline) via a temp file and rename,
+    so a concurrent reader (the MCP server, another CLI) never sees a partial file."""
+    import json
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + f".tmp{os.getpid()}")
+    with tmp.open("w", encoding="utf-8", newline="\n") as fh:
+        json.dump(data, fh, ensure_ascii=False, indent=2)
+        fh.write("\n")
+    os.replace(tmp, path)
 
 
 def utc_now_iso() -> str:

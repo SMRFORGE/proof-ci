@@ -55,6 +55,7 @@ __all__ = [
     "human_duration",
     "parse_when",
     "payoff",
+    "report_for",
     "to_micro",
     "token_count",
 ]
@@ -837,4 +838,26 @@ def build_report(
         headline=head,
         totals=totals,
         groups=groups,
+    )
+
+
+def report_for(
+    cfg: Any, *, since: str | None, until: str | None, by: str, weekly: bool
+) -> SavingsReport:
+    """The SavingsReport for a window (``since``/``until`` as RFC 3339 or ``Nd``/``Nw``).
+
+    Raises ValueError for unparsable windows or an unknown grouping.
+    """
+    if by not in ("repo", "agent", "branch"):
+        raise ValueError("by must be repo, agent, or branch")
+    start = parse_when(since or "30d")
+    end = parse_when(until) if until else datetime.now(UTC)
+    rows = SavingsLedger(cfg.resolve(cfg.savings.db)).rows(_iso(start), _iso(end))
+    return build_report(
+        rows,
+        since=start,
+        until=end,
+        group_by=by,  # type: ignore[arg-type]
+        weekly=weekly,
+        repo_name=cfg.project_name,
     )

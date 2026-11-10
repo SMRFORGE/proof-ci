@@ -45,6 +45,8 @@ __all__ = [
     "FlakeSnapshot",
     "FlakeStore",
     "code_hash",
+    "flake_store",
+    "statuses_for",
 ]
 
 PASS_LIKE = frozenset({"passed", "xpassed"})
@@ -457,3 +459,24 @@ class FlakeStore:
                 f"SELECT {self._COLS} FROM flake_records WHERE test_id = ?", (test_id,)
             ).fetchone()
             return self._to_model(conn, test_id, self._row(r))
+
+
+def flake_store(cfg: Any) -> FlakeStore:
+    """The flake store configured for a repository."""
+    return FlakeStore(
+        cfg.resolve(cfg.flakes.db),
+        min_runs=cfg.flakes.min_runs,
+        window_days=cfg.flakes.window_days,
+        min_flips_confirmed=cfg.flakes.min_flips_confirmed,
+    )
+
+
+def statuses_for(status: str | None) -> tuple[str, ...]:
+    """``flakes list --status`` / ``list_flaky_tests.status`` to the statuses to show."""
+    if status is None:
+        return ("suspected", "confirmed")
+    if status == "all":
+        return ("suspected", "confirmed", "ignored")
+    if status in ("suspected", "confirmed", "resolved", "ignored"):
+        return (status,)
+    raise ValueError(f"unknown status {status!r}")
