@@ -3,15 +3,15 @@
 The Typer app object is named ``app`` so the ``[project.scripts]`` entry
 ``proof-ci = "proof_ci.cli:app"`` works (spec Section 5.3).
 
-Milestone M1: the CLI reports its version and help only. Leaf commands arrive
-in later milestones; each of them is decorated with :func:`common_options` so
-``--json``, ``--repo``, and ``--config`` are accepted on every leaf command
-(spec Section 5.7).
+Every leaf command is decorated with :func:`common_options` so ``--json``,
+``--repo``, and ``--config`` are accepted on every leaf command (spec Section
+5.7). Exit codes follow spec Section 5.5.
 """
 
 from __future__ import annotations
 
 import inspect
+import json
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -22,8 +22,20 @@ from typing import Annotated, Any
 import typer
 
 from proof_ci import __version__
+from proof_ci.config import ConfigError, InitIOError, find_repo_root, init_repo
 
-__all__ = ["CommonOptions", "app", "common_options", "configure_utf8_streams"]
+__all__ = [
+    "EXIT_RUNTIME",
+    "EXIT_USAGE",
+    "CommonOptions",
+    "app",
+    "common_options",
+    "configure_utf8_streams",
+    "emit_json",
+]
+
+EXIT_USAGE = 2
+EXIT_RUNTIME = 3
 
 
 def configure_utf8_streams() -> None:
@@ -187,3 +199,60 @@ def _root(
 # Reconfigure at import so the console-script entry point (which calls ``app()``
 # directly) emits UTF-8 from the first byte, including eager ``--version`` output.
 configure_utf8_streams()
+
+
+def emit_json(obj: Any) -> None:
+    """Print the primary JSON object on stdout (spec Section 5.6)."""
+    sys.stdout.write(json.dumps(obj, ensure_ascii=False, indent=2) + "\n")
+    sys.stdout.flush()
+
+
+def _warn(message: str) -> None:
+    typer.echo(f"warning: {message}", err=True)
+
+
+def _fail(message: str, code: int) -> typer.Exit:
+    typer.echo(f"error: {message}", err=True)
+    return typer.Exit(code)
+
+
+@app.command()
+@common_options
+def init(
+    force: Annotated[
+        bool, typer.Option("--force", help="Overwrite an existing proof-ci.toml.")
+    ] = False,
+    no_key: Annotated[
+        bool, typer.Option("--no-key", help="Do not create a signing key (containers, CI).")
+    ] = False,
+    *,
+    common: CommonOptions,
+) -> None:
+    """Write proof-ci.toml, create .proof-ci/, and update .gitignore."""
+    if common.repo is not None:
+        root = common.repo
+    else:
+        try:
+            root = find_repo_root()
+        except ConfigError:
+            root = Path.cwd()
+    try:
+        result = init_repo(root, common.config, force=force, no_key=no_key)
+    except ConfigError as exc:
+        raise _fail(str(exc), EXIT_USAGE) from exc
+    except InitIOError as exc:
+        raise _fail(str(exc), EXIT_RUNTIME) from exc
+
+    for message in result.warnings:
+        _warn(message)
+    if common.json_output:
+        emit_json(result.as_json())
+        return
+    typer.echo(f"Wrote {result.config_path}")
+    typer.echo(f"Created {result.repo / '.proof-ci'}")
+    if result.gitignore_added:
+        typer.echo(f"Added {len(result.gitignore_added)} entries to .gitignore")
+    if result.key_created:
+        typer.echo("Created a signing key")
+    else:
+        typer.echo(f"No signing key created: {result.key_skipped_reason}")
