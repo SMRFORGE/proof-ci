@@ -1,0 +1,458 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://proof-ci.dev/schemas/v1/savings.json",
+  "title": "Savings",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "headline",
+    "overall_confidence",
+    "currency",
+    "is_calibration_run",
+    "prices_configured",
+    "prices_used",
+    "calibration",
+    "wrong_turns",
+    "ci_runs_avoided",
+    "local_compute",
+    "wait",
+    "tokens",
+    "totals"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "1.0.0"
+    },
+    "headline": {
+      "type": "string",
+      "description": "One line for CLI/MCP, e.g. 'Checked 14/1,200 (12 cached) in 22s; flaky flagged 1; CI runs avoided 0; local test-min not run ~18'. Money is appended only when prices_configured is true (Section 5.12)."
+    },
+    "overall_confidence": {
+      "type": "string",
+      "enum": [
+        "high",
+        "medium",
+        "low"
+      ]
+    },
+    "currency": {
+      "const": "USD"
+    },
+    "is_calibration_run": {
+      "type": "boolean"
+    },
+    "prices_configured": {
+      "type": "boolean",
+      "description": "True only when every [savings] price key applied in this run is present in proof-ci.toml. Gates all dollar figures in headlines and dashboards."
+    },
+    "prices_used": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "ci_cost_per_minute_micro_usd",
+        "price_local_minutes",
+        "local_compute_cost_per_minute_micro_usd",
+        "model_input_cost_per_million_tokens_micro_usd",
+        "model_output_cost_per_million_tokens_micro_usd",
+        "wasted_fix_cost_micro_usd",
+        "engineer_hourly_cost_micro_usd",
+        "defaults_used"
+      ],
+      "properties": {
+        "ci_cost_per_minute_micro_usd": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "price_local_minutes": {
+          "type": "boolean",
+          "description": "[savings].price_local_minutes. False means local_compute.cost_micro_usd is 0 by rule."
+        },
+        "local_compute_cost_per_minute_micro_usd": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "model_input_cost_per_million_tokens_micro_usd": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "model_output_cost_per_million_tokens_micro_usd": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "wasted_fix_cost_micro_usd": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "engineer_hourly_cost_micro_usd": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "0 means the optional engineer hourly rate was not set."
+        },
+        "defaults_used": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Names of [savings] price keys absent from proof-ci.toml, so the documented default was applied."
+        }
+      }
+    },
+    "calibration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "test_count",
+        "payoff"
+      ],
+      "properties": {
+        "status": {
+          "type": "string",
+          "enum": [
+            "missing",
+            "stale",
+            "current"
+          ]
+        },
+        "calibrated_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "test_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "full_suite_wall_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "fixed_overhead_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "description": "Measured wall time of proof-ci's own fixed work (collect pass, git, hashing) during the calibration run."
+        },
+        "payoff": {
+          "type": "string",
+          "enum": [
+            "unknown",
+            "overhead_dominates",
+            "marginal",
+            "selection_saves_time"
+          ],
+          "description": "Section 5.12 payoff verdict from full_suite_wall_ms versus fixed_overhead_ms. unknown when calibration is missing."
+        },
+        "uncalibrated_skipped_count": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "wrong_turns": {
+      "$ref": "#/$defs/wrong_turns_metric"
+    },
+    "ci_runs_avoided": {
+      "$ref": "#/$defs/ci_runs_metric"
+    },
+    "local_compute": {
+      "$ref": "#/$defs/local_compute_metric"
+    },
+    "wait": {
+      "$ref": "#/$defs/wait_metric"
+    },
+    "tokens": {
+      "$ref": "#/$defs/tokens_metric"
+    },
+    "totals": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "cost_micro_usd",
+        "wrong_turns_avoided",
+        "ci_runs_avoided",
+        "test_ms_not_executed",
+        "wait_ms_saved",
+        "tokens_delta"
+      ],
+      "properties": {
+        "cost_micro_usd": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "wrong_turns_avoided": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "ci_runs_avoided": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "test_ms_not_executed": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "wait_ms_saved": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "tokens_delta": {
+          "type": "integer",
+          "description": "May be negative."
+        }
+      }
+    }
+  },
+  "$defs": {
+    "status": {
+      "type": "string",
+      "enum": [
+        "measured",
+        "estimated",
+        "unavailable"
+      ]
+    },
+    "confidence": {
+      "type": "string",
+      "enum": [
+        "high",
+        "medium",
+        "low"
+      ]
+    },
+    "wrong_turns_metric": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "confidence",
+        "flagged_known_flake_failures",
+        "cost_micro_usd",
+        "rationale"
+      ],
+      "properties": {
+        "status": {
+          "$ref": "#/$defs/status"
+        },
+        "confidence": {
+          "$ref": "#/$defs/confidence"
+        },
+        "flagged_known_flake_failures": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "cost_micro_usd": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "rationale": {
+          "type": "string"
+        }
+      }
+    },
+    "ci_runs_metric": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "confidence",
+        "count",
+        "dedupe_key",
+        "deduplicated",
+        "cost_micro_usd",
+        "rationale"
+      ],
+      "properties": {
+        "status": {
+          "$ref": "#/$defs/status"
+        },
+        "confidence": {
+          "$ref": "#/$defs/confidence"
+        },
+        "count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "dedupe_key": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Hex SHA-256 over branch, commit_tree, and the sorted failing non-flaky test ids (Section 5.12(b)). Null when there was no qualifying failure."
+        },
+        "deduplicated": {
+          "type": "boolean",
+          "description": "True when the same dedupe_key already appears in the ledger, so count is 0 although the run failed."
+        },
+        "cost_micro_usd": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "rationale": {
+          "type": "string"
+        }
+      }
+    },
+    "local_compute_metric": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "confidence",
+        "deselected_count",
+        "cache_hits",
+        "test_ms_not_executed",
+        "priced",
+        "cost_micro_usd",
+        "rationale"
+      ],
+      "properties": {
+        "status": {
+          "$ref": "#/$defs/status"
+        },
+        "confidence": {
+          "$ref": "#/$defs/confidence"
+        },
+        "deselected_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "cache_hits": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "test_ms_not_executed": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Sum of calibrated durations of deselected and cache-hit tests: minutes of this machine not spent, not CI minutes."
+        },
+        "priced": {
+          "type": "boolean"
+        },
+        "cost_micro_usd": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "rationale": {
+          "type": "string"
+        }
+      }
+    },
+    "wait_metric": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "confidence",
+        "baseline_kind",
+        "baseline_ms",
+        "actual_ms",
+        "wait_ms_saved",
+        "rationale"
+      ],
+      "properties": {
+        "status": {
+          "$ref": "#/$defs/status"
+        },
+        "confidence": {
+          "$ref": "#/$defs/confidence"
+        },
+        "baseline_kind": {
+          "type": "string",
+          "enum": [
+            "none",
+            "full_suite_local",
+            "full_pipeline_user"
+          ],
+          "description": "full_suite_local = calibration wall clock of the whole suite on this machine (a proxy, capped at medium confidence); full_pipeline_user = [savings].full_pipeline_baseline_ms supplied by the user."
+        },
+        "baseline_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "actual_ms": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "wait_ms_saved": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "rationale": {
+          "type": "string"
+        }
+      }
+    },
+    "tokens_metric": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "confidence",
+        "raw_source",
+        "raw_bytes",
+        "structured_bytes",
+        "raw_tokens",
+        "structured_tokens",
+        "tokens_delta",
+        "cost_micro_usd",
+        "tokenizer",
+        "rationale"
+      ],
+      "properties": {
+        "status": {
+          "$ref": "#/$defs/status"
+        },
+        "confidence": {
+          "$ref": "#/$defs/confidence"
+        },
+        "raw_source": {
+          "const": "pytest_stdout",
+          "description": "raw_bytes is the actual stdout of the pytest subprocess at the configured verbosity, not a reconstruction."
+        },
+        "raw_bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "structured_bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "raw_tokens": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "structured_tokens": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "tokens_delta": {
+          "type": "integer",
+          "description": "raw_tokens minus structured_tokens. Negative when the structured summary is larger than pytest's own output."
+        },
+        "cost_micro_usd": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Input-token price applied to max(0, tokens_delta)."
+        },
+        "tokenizer": {
+          "const": "utf8_bytes_div_4"
+        },
+        "rationale": {
+          "type": "string"
+        }
+      }
+    }
+  }
+}

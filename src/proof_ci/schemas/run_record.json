@@ -1,0 +1,300 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://proof-ci.dev/schemas/v1/run-record.json",
+  "title": "RunRecord",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "payload"
+  ],
+  "properties": {
+    "payload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "run_id",
+        "timestamp",
+        "commit",
+        "selection",
+        "agent",
+        "environment",
+        "checks",
+        "summary",
+        "results"
+      ],
+      "properties": {
+        "schema_version": {
+          "const": "1.0.0"
+        },
+        "run_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "timestamp": {
+          "type": "string"
+        },
+        "commit": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "sha",
+            "tree",
+            "dirty"
+          ],
+          "properties": {
+            "sha": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Full sha of HEAD at run time."
+            },
+            "tree": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Git tree hash of the working tree as tested, including staged, unstaged, and untracked non-ignored files (Section 4.7, Tree hash). Equals the tree of HEAD when dirty is false."
+            },
+            "dirty": {
+              "type": "boolean",
+              "description": "True if the working tree or index differed from the named commit."
+            }
+          }
+        },
+        "selection": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "mode",
+            "base_ref",
+            "changed_files",
+            "selected_count",
+            "collected_count",
+            "deselected_count",
+            "fallback_full_run",
+            "fallback_reason"
+          ],
+          "properties": {
+            "mode": {
+              "type": "string",
+              "enum": [
+                "affected",
+                "all",
+                "explicit",
+                "failed"
+              ]
+            },
+            "base_setting": {
+              "type": "string"
+            },
+            "base_ref": {
+              "type": "string"
+            },
+            "changed_files": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "selected_count": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "collected_count": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "deselected_count": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "fallback_full_run": {
+              "type": "boolean"
+            },
+            "fallback_reason": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "fallback_suppressed_by_tree": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        },
+        "agent": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "id"
+          ],
+          "properties": {
+            "id": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Opaque task or client identifier. Not a vendor account id."
+            },
+            "agent_name": {
+              "type": "string",
+              "description": "Generic product name supplied by the client (e.g. claude-code, cursor, codex, windsurf, cline, copilot, cli). Core does not interpret it."
+            },
+            "agent_version": {
+              "type": "string"
+            },
+            "model": {
+              "type": "string",
+              "description": "Optional model identifier if the client reports one. Opaque; core does not specialize on vendor model names."
+            },
+            "session": {
+              "type": "string"
+            }
+          }
+        },
+        "environment": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "python",
+            "platform",
+            "proof_ci_version"
+          ],
+          "properties": {
+            "python": {
+              "type": "string"
+            },
+            "platform": {
+              "type": "string"
+            },
+            "proof_ci_version": {
+              "type": "string"
+            },
+            "os_release": {
+              "type": "string"
+            }
+          }
+        },
+        "checks": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "name",
+              "command"
+            ],
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "command": {
+                "type": "string"
+              },
+              "selector": {
+                "type": "string",
+                "enum": [
+                  "affected",
+                  "all",
+                  "explicit",
+                  "failed"
+                ]
+              }
+            }
+          }
+        },
+        "summary": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "outcome",
+            "passed",
+            "failed",
+            "skipped",
+            "error",
+            "executed",
+            "replayed",
+            "duration_ms"
+          ],
+          "properties": {
+            "outcome": {
+              "type": "string",
+              "enum": [
+                "passed",
+                "failed",
+                "error"
+              ]
+            },
+            "passed": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "failed": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "skipped": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "error": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "executed": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Results produced by running pytest in this run (cache_hit false)."
+            },
+            "replayed": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Results replayed from the cache in this run (cache_hit true). executed + replayed equals results.length."
+            },
+            "duration_ms": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        },
+        "results": {
+          "type": "array",
+          "items": {
+            "$ref": "https://proof-ci.dev/schemas/v1/test-result.json"
+          }
+        },
+        "savings": {
+          "$ref": "https://proof-ci.dev/schemas/v1/savings.json",
+          "description": "Required on every run produced after milestone M9. Omitted only on records created before the savings subsystem existed."
+        }
+      }
+    },
+    "signature": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "alg",
+        "key_id",
+        "public_key",
+        "value"
+      ],
+      "properties": {
+        "alg": {
+          "const": "Ed25519"
+        },
+        "key_id": {
+          "type": "string",
+          "description": "First 16 hex characters of SHA-256 over the raw 32-byte public key."
+        },
+        "public_key": {
+          "type": "string",
+          "description": "Base64 (standard, not URL-safe) encoding of the raw 32-byte Ed25519 public key."
+        },
+        "value": {
+          "type": "string",
+          "description": "Base64 (standard, not URL-safe) encoding of the 64-byte Ed25519 signature."
+        }
+      }
+    }
+  }
+}

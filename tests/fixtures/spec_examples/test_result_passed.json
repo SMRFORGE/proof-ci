@@ -1,0 +1,18 @@
+{
+  "schema_version": "1.0.0",
+  "test_id": "tests/test_math.py::test_add",
+  "outcome": "passed",
+  "duration_ms": 4,
+  "location": {
+    "file": "tests/test_math.py",
+    "line": 4,
+    "function": "test_add"
+  },
+  "message": "",
+  "cache_hit": false,
+  "flaky": {
+    "is_flaky": false,
+    "status": "none"
+  },
+  "markers": []
+}

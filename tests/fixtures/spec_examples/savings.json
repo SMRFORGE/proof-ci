@@ -1,0 +1,88 @@
+{
+  "schema_version": "1.0.0",
+  "headline": "Checked 2/8 (0 cached) in 1s; flaky flagged 0; CI runs avoided 1; local test-min not run ~0 (uncalibrated)",
+  "overall_confidence": "low",
+  "currency": "USD",
+  "is_calibration_run": false,
+  "prices_configured": false,
+  "prices_used": {
+    "ci_cost_per_minute_micro_usd": 10000,
+    "price_local_minutes": false,
+    "local_compute_cost_per_minute_micro_usd": 0,
+    "model_input_cost_per_million_tokens_micro_usd": 3000000,
+    "model_output_cost_per_million_tokens_micro_usd": 15000000,
+    "wasted_fix_cost_micro_usd": 25000000,
+    "engineer_hourly_cost_micro_usd": 0,
+    "defaults_used": [
+      "ci_cost_per_minute",
+      "model_input_cost_per_million_tokens",
+      "model_output_cost_per_million_tokens",
+      "wasted_fix_cost"
+    ]
+  },
+  "calibration": {
+    "status": "missing",
+    "calibrated_at": null,
+    "test_count": 0,
+    "full_suite_wall_ms": null,
+    "fixed_overhead_ms": null,
+    "payoff": "unknown",
+    "uncalibrated_skipped_count": 6
+  },
+  "wrong_turns": {
+    "status": "measured",
+    "confidence": "high",
+    "flagged_known_flake_failures": 0,
+    "cost_micro_usd": 0,
+    "rationale": "No failures in this run had flaky.status of confirmed or ignored."
+  },
+  "ci_runs_avoided": {
+    "status": "estimated",
+    "confidence": "medium",
+    "count": 1,
+    "dedupe_key": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "deduplicated": false,
+    "cost_micro_usd": 0,
+    "rationale": "The run had a non-flaky failure not previously recorded for this branch and tree, so a push would likely have produced a failing CI run. No pipeline baseline is stored, so the avoided-run cost is 0 rather than invented."
+  },
+  "local_compute": {
+    "status": "estimated",
+    "confidence": "low",
+    "deselected_count": 6,
+    "cache_hits": 0,
+    "test_ms_not_executed": 0,
+    "priced": false,
+    "cost_micro_usd": 0,
+    "rationale": "No calibration exists yet, so deselected tests have no measured duration and local test time not executed is reported as 0 rather than invented. Local minutes are not priced (price_local_minutes is false)."
+  },
+  "wait": {
+    "status": "unavailable",
+    "confidence": "low",
+    "baseline_kind": "none",
+    "baseline_ms": null,
+    "actual_ms": 1240,
+    "wait_ms_saved": 0,
+    "rationale": "No full-suite calibration or user-supplied pipeline baseline is stored."
+  },
+  "tokens": {
+    "status": "measured",
+    "confidence": "medium",
+    "raw_source": "pytest_stdout",
+    "raw_bytes": 612,
+    "structured_bytes": 1640,
+    "raw_tokens": 153,
+    "structured_tokens": 410,
+    "tokens_delta": -257,
+    "cost_micro_usd": 0,
+    "tokenizer": "utf8_bytes_div_4",
+    "rationale": "Measured the pytest subprocess stdout (612 bytes at -q --tb=short) against the RunSummary JSON without the savings object (1640 bytes); the structured form is larger for this two-test run, so no token saving is claimed."
+  },
+  "totals": {
+    "cost_micro_usd": 0,
+    "wrong_turns_avoided": 0,
+    "ci_runs_avoided": 1,
+    "test_ms_not_executed": 0,
+    "wait_ms_saved": 0,
+    "tokens_delta": -257
+  }
+}

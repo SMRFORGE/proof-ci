@@ -1,0 +1,143 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://proof-ci.dev/schemas/v1/savings-report.json",
+  "title": "SavingsReport",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "since",
+    "until",
+    "group_by",
+    "weekly",
+    "runs",
+    "overall_confidence",
+    "defaults_used",
+    "prices_configured",
+    "headline",
+    "totals",
+    "groups"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "1.0.0"
+    },
+    "since": {
+      "type": "string"
+    },
+    "until": {
+      "type": "string"
+    },
+    "group_by": {
+      "type": "string",
+      "enum": [
+        "repo",
+        "agent",
+        "branch"
+      ]
+    },
+    "weekly": {
+      "type": "boolean"
+    },
+    "runs": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "overall_confidence": {
+      "type": "string",
+      "enum": [
+        "high",
+        "medium",
+        "low"
+      ]
+    },
+    "defaults_used": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Union of defaults_used across the included runs."
+    },
+    "prices_configured": {
+      "type": "boolean",
+      "description": "True only when every included run had prices_configured true. Dollar totals are shown only then."
+    },
+    "headline": {
+      "type": "string"
+    },
+    "totals": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "cost_micro_usd",
+        "wrong_turns_avoided",
+        "ci_runs_avoided",
+        "test_ms_not_executed",
+        "wait_ms_saved",
+        "tokens_delta"
+      ],
+      "properties": {
+        "cost_micro_usd": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "wrong_turns_avoided": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "ci_runs_avoided": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "test_ms_not_executed": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "wait_ms_saved": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "tokens_delta": {
+          "type": "integer"
+        }
+      }
+    },
+    "groups": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "key",
+          "runs",
+          "totals",
+          "overall_confidence"
+        ],
+        "properties": {
+          "key": {
+            "type": "string"
+          },
+          "week": {
+            "type": "string",
+            "description": "ISO week, e.g. 2026-W45, when weekly is true."
+          },
+          "runs": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "totals": {
+            "type": "object"
+          },
+          "overall_confidence": {
+            "type": "string",
+            "enum": [
+              "high",
+              "medium",
+              "low"
+            ]
+          }
+        }
+      }
+    }
+  }
+}

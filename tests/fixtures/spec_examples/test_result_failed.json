@@ -1,0 +1,33 @@
+{
+  "schema_version": "1.0.0",
+  "test_id": "tests/test_math.py::test_div",
+  "outcome": "failed",
+  "duration_ms": 7,
+  "location": {
+    "file": "tests/test_math.py",
+    "line": 12,
+    "function": "test_div"
+  },
+  "message": "assert 1 == 0",
+  "cache_hit": false,
+  "flaky": {
+    "is_flaky": false,
+    "status": "none"
+  },
+  "markers": [],
+  "failure": {
+    "error_type": "AssertionError",
+    "error_message": "assert 1 == 0",
+    "file": "tests/test_math.py",
+    "line": 13,
+    "assertion": "assert div(1, 1) == 0",
+    "traceback": "Traceback (most recent call last):\n  File \"tests/test_math.py\", line 13, in test_div\n    assert div(1, 1) == 0\nAssertionError: assert 1 == 0",
+    "likely_cause": {
+      "file": "src/demo/mathops.py",
+      "line": 8,
+      "diff_hunk": "@@ -5,6 +5,6 @@\n-    return 0\n+    return left // right",
+      "rationale": "The failing traceback frame is in tests/test_math.py:13, which imports demo.mathops; that module intersects the current diff at line 8."
+    },
+    "repro_command": "pytest -q tests/test_math.py::test_div"
+  }
+}

@@ -1,0 +1,211 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://proof-ci.dev/schemas/v1/test-result.json",
+  "title": "TestResult",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "test_id",
+    "outcome",
+    "duration_ms",
+    "location",
+    "cache_hit"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "1.0.0"
+    },
+    "test_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Stable identifier. For pytest this is the nodeid, e.g. tests/test_foo.py::TestBox::test_bar[param]."
+    },
+    "outcome": {
+      "type": "string",
+      "enum": [
+        "passed",
+        "failed",
+        "skipped",
+        "error",
+        "xfailed",
+        "xpassed"
+      ]
+    },
+    "duration_ms": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "location": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "file",
+        "line"
+      ],
+      "properties": {
+        "file": {
+          "type": "string",
+          "minLength": 1
+        },
+        "line": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "function": {
+          "type": "string"
+        }
+      }
+    },
+    "message": {
+      "type": "string",
+      "description": "One-line error or skip reason. Empty string if passed."
+    },
+    "cache_hit": {
+      "type": "boolean"
+    },
+    "flaky": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "is_flaky",
+        "status"
+      ],
+      "properties": {
+        "is_flaky": {
+          "type": "boolean"
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "none",
+            "suspected",
+            "confirmed",
+            "resolved",
+            "ignored"
+          ]
+        },
+        "flip_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "reason": {
+          "type": "string"
+        }
+      }
+    },
+    "stdout": {
+      "type": "string",
+      "maxLength": 8192
+    },
+    "stderr": {
+      "type": "string",
+      "maxLength": 8192
+    },
+    "markers": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "failure": {
+      "$ref": "#/$defs/Failure"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "outcome": {
+            "enum": [
+              "failed",
+              "error"
+            ]
+          }
+        },
+        "required": [
+          "outcome"
+        ]
+      },
+      "then": {
+        "required": [
+          "failure"
+        ]
+      },
+      "else": {
+        "not": {
+          "required": [
+            "failure"
+          ]
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "Failure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "error_type",
+        "error_message",
+        "repro_command"
+      ],
+      "properties": {
+        "error_type": {
+          "type": "string",
+          "description": "Exception class name, e.g. AssertionError or FileNotFoundError."
+        },
+        "error_message": {
+          "type": "string"
+        },
+        "file": {
+          "type": "string",
+          "description": "File of the failing assertion or exception, repo-relative if inside the repo."
+        },
+        "line": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "assertion": {
+          "type": "string",
+          "description": "Assertion line or comparison summary when available."
+        },
+        "traceback": {
+          "type": "string",
+          "maxLength": 16384,
+          "description": "Plain-text traceback, already truncated."
+        },
+        "likely_cause": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "rationale"
+          ],
+          "properties": {
+            "file": {
+              "type": "string"
+            },
+            "line": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "diff_hunk": {
+              "type": "string",
+              "maxLength": 4096,
+              "description": "The intersecting unified-diff hunk, truncated."
+            },
+            "rationale": {
+              "type": "string",
+              "description": "Why this location was chosen, one or two sentences."
+            }
+          }
+        },
+        "repro_command": {
+          "type": "string",
+          "minLength": 1,
+          "description": "A command that reruns only this test, e.g. pytest -q tests/test_foo.py::test_bar"
+        }
+      }
+    }
+  }
+}
