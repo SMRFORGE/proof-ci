@@ -218,12 +218,16 @@ FAKE = textwrap.dedent(
 
 
 def fake_repo(demo: Path, tmp_path: Path, mode: str, monkeypatch: pytest.MonkeyPatch) -> Path:
-    script = tmp_path / "fake_pytest.py"
-    script.write_text(FAKE, encoding="utf-8")
+    # A fake `pytest` module that `python -m pytest` finds first via PYTHONPATH:
+    # Phase 1 only executes pytest invocations, so the fake has to look like one.
+    fake_dir = tmp_path / "fakepkg"
+    fake_dir.mkdir()
+    (fake_dir / "pytest.py").write_text(FAKE, encoding="utf-8")
     log = tmp_path / "fake.log"
     monkeypatch.setenv("FAKE_LOG", str(log))
     monkeypatch.setenv("FAKE_MODE", mode)
-    write_config(demo, [sys.executable, str(script)])
+    monkeypatch.setenv("PYTHONPATH", str(fake_dir))
+    write_config(demo, [sys.executable, "-m", "pytest"])
     return log
 
 
@@ -257,8 +261,8 @@ def test_plugin_not_importable_exits_3(
     assert "not importable" in result.stderr
 
 
-def test_missing_interpreter_exits_3(demo: Path) -> None:
-    write_config(demo, ["definitely-not-a-real-python-xyz", "-m", "pytest"])
+def test_missing_interpreter_exits_3(demo: Path, tmp_path: Path) -> None:
+    write_config(demo, [str(tmp_path / "nowhere" / "python"), "-m", "pytest"])
     assert invoke("run", "--all", "--repo", str(demo)).exit_code == 3
 
 

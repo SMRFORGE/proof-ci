@@ -241,6 +241,10 @@ def init(
     no_key: Annotated[
         bool, typer.Option("--no-key", help="Do not create a signing key (containers, CI).")
     ] = False,
+    discover: Annotated[
+        bool,
+        typer.Option("--discover", help="Read CI config and use its pytest command."),
+    ] = False,
     *,
     common: CommonOptions,
 ) -> None:
@@ -253,7 +257,7 @@ def init(
         except ConfigError:
             root = Path.cwd()
     try:
-        result = init_repo(root, common.config, force=force, no_key=no_key)
+        result = init_repo(root, common.config, force=force, no_key=no_key, discover=discover)
     except ConfigError as exc:
         raise _fail(str(exc), EXIT_USAGE) from exc
     except InitIOError as exc:
@@ -265,6 +269,11 @@ def init(
         emit_json(result.as_json())
         return
     typer.echo(f"Wrote {result.config_path}")
+    if discover:
+        if result.discovered_command:
+            typer.echo(f"Discovered test command: {result.discovered_command}")
+        else:
+            typer.echo("No high-confidence pytest command found in CI config; using pytest")
     typer.echo(f"Created {result.repo / '.proof-ci'}")
     if result.gitignore_added:
         typer.echo(f"Added {len(result.gitignore_added)} entries to .gitignore")
@@ -924,3 +933,41 @@ def savings_calibrate(*, common: CommonOptions) -> None:
             payoff_sentence(cal.payoff, cal.full_suite_wall_ms or 0, cal.fixed_overhead_ms or 0)
         )
     raise typer.Exit(outcome.exit_code)
+
+
+@app.command("discover")
+@common_options
+def discover_cmd(*, common: CommonOptions) -> None:
+    """List test commands found in CI config (read-only; nothing is executed)."""
+    from proof_ci.discover import discover
+
+    if common.repo is not None:
+        root = common.repo
+    else:
+        try:
+            root = find_repo_root()
+        except ConfigError as exc:
+            raise _fail(str(exc), EXIT_USAGE) from exc
+    try:
+        cfg = load_config(root, common.config)
+        discovery_cfg = cfg.discovery
+    except ConfigError:
+        from proof_ci.config import DiscoveryConfig
+
+        discovery_cfg = DiscoveryConfig()
+    result = discover(root.resolve(), discovery_cfg)
+    if common.json_output:
+        emit_json(
+            {
+                "best": result.best,
+                "candidates": [c.as_json() for c in result.candidates],
+            }
+        )
+        return
+    if not result.candidates:
+        typer.echo("No test commands found in CI config.")
+    for c in result.candidates:
+        note = f"  (skipped: {c.skipped_reason})" if c.skipped_reason else ""
+        typer.echo(f"[{c.confidence}] {c.source_path} :: {c.job_name}: {c.command}{note}")
+    if result.best:
+        typer.echo(f"Suggested test_command = {json.dumps(result.best)}")

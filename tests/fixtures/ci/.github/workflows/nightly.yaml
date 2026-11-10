@@ -1,0 +1,6 @@
+jobs:
+  nightly:
+    runs-on: ubuntu-latest
+    steps:
+      - run: uv run pytest -q tests/slow
+      - run: nox -s tests

@@ -456,12 +456,15 @@ FAKE = textwrap.dedent(
 def test_collection_cache_skips_collect_and_invalidates(
     demo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    script = tmp_path / "fake.py"
-    script.write_text(FAKE, encoding="utf-8")
+    fake_dir = tmp_path / "fakepkg"
+    fake_dir.mkdir()
+    (fake_dir / "pytest.py").write_text(FAKE, encoding="utf-8")
     log = tmp_path / "log"
     monkeypatch.setenv("FAKE_LOG", str(log))
+    monkeypatch.setenv("PYTHONPATH", str(fake_dir))
     (demo / "proof-ci.toml").write_text(
-        f"[project]\ntest_command = {_toml_list([sys.executable, str(script)])}\n", encoding="utf-8"
+        f"[project]\ntest_command = {_toml_list([sys.executable, '-m', 'pytest'])}\n",
+        encoding="utf-8",
     )
 
     def collects() -> int:

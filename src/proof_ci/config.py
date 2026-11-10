@@ -8,6 +8,7 @@ spec Section 5.5) so a typo does not silently fall back to a default.
 
 from __future__ import annotations
 
+import json
 import os
 import shlex
 import tomllib
@@ -523,6 +524,7 @@ def init_repo(
     *,
     force: bool = False,
     no_key: bool = False,
+    discover: bool = False,
     config_dir: Path | None = None,
 ) -> InitResult:
     """Implement ``proof-ci init`` (spec Section 5.7.1).
@@ -553,7 +555,16 @@ def init_repo(
             (state / sub).mkdir(parents=True, exist_ok=True)
         added = _ensure_gitignore(repo_root)
         config_path.parent.mkdir(parents=True, exist_ok=True)
-        _write_text(config_path, DEFAULT_CONFIG_TEXT)
+        text = DEFAULT_CONFIG_TEXT
+        discovered: list[str] | None = None
+        if discover:
+            from proof_ci.discover import discover as run_discovery
+
+            discovered = run_discovery(repo_root, DiscoveryConfig()).best
+            if discovered is not None:
+                line = 'test_command = ["pytest"]\n'
+                text = text.replace(line, f"test_command = {json.dumps(discovered)}\n", 1)
+        _write_text(config_path, text)
     except OSError as exc:
         raise InitIOError(f"cannot initialise {repo_root}: {exc}") from exc
 
@@ -566,7 +577,7 @@ def init_repo(
         config_path=config_path,
         key_created=key_created,
         key_skipped_reason=skipped,
-        discovered_command=None,
+        discovered_command=discovered,
         gitignore_added=added,
         warnings=tuple(warnings),
     )

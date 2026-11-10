@@ -1,0 +1,45 @@
+stages: [lint, test, deploy]
+variables:
+  PIP_CACHE_DIR: .cache/pip
+default:
+  image: python:3.12
+
+.template:
+  script:
+    - pytest --this-is-a-template
+
+lint:
+  stage: lint
+  script:
+    - ruff check src tests
+
+unit:
+  stage: test
+  script:
+    - pip install -e ".[dev]"
+    - pytest -q tests --maxfail=1   # the real test command
+    - pytest -q tests
+
+legacy:
+  script:
+    - tox -e py312
+
+deploy-prod:
+  stage: deploy
+  script:
+    - pytest -q smoke
+    - ./deploy.sh
+
+smoke:
+  environment:
+    name: production
+  script:
+    - pytest -q smoke
+
+pages:
+  script:
+    - mkdocs build
+
+helm-check:
+  script:
+    - helm lint chart && pytest -q chart_tests

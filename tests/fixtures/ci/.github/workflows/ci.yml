@@ -1,0 +1,16 @@
+name: ci
+on: [push]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: tests
+        run: |
+          set -euo pipefail
+          python -m pytest -x --tb=short | tee out.txt
+      - run: make check
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - run: pytest -q && twine upload dist/*

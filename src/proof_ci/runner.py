@@ -100,6 +100,19 @@ class RunOutcome:
     savings: Savings | None = None
 
 
+def _require_pytest_command(cfg: Config) -> None:
+    """Phase 1 runs pytest only, so the plugin always loads (spec Section 5.13)."""
+    from proof_ci.discover import is_pytest_command
+
+    if not is_pytest_command(cfg.project.test_command):
+        shown = " ".join(cfg.project.test_command)
+        raise ConfigError(
+            f"[project].test_command = {shown!r} is not a pytest invocation; Phase 1 runs pytest "
+            'directly so its plugin loads. Set test_command = ["pytest"] or '
+            '["python", "-m", "pytest"] (extra arguments are fine).'
+        )
+
+
 def _validate_test_args(cfg: Config, tests: tuple[str, ...]) -> None:
     """Spec Section 5.15 item 5: no option injection, no paths outside the repo."""
     root = cfg.repo_root.resolve()
@@ -384,6 +397,7 @@ def _git_state(cfg: Config) -> tuple[GitInfo, CaseIndex]:
 
 def compute_affected(cfg: Config, base: str | None) -> SelectionPlan:
     """``proof-ci affected``: selection only, never runs tests."""
+    _require_pytest_command(cfg)
     info, case = _git_state(cfg)
     work = cfg.repo_root / STATE_DIR / "runs" / "affected"
     work.mkdir(parents=True, exist_ok=True)
@@ -570,6 +584,7 @@ def _savings(
 
 def execute_run(cfg: Config, options: RunOptions) -> RunOutcome:
     """Run the selected tests and write the run artifacts. Raises ConfigError (2) or RunError (3)."""
+    _require_pytest_command(cfg)
     if options.mode == "explicit":
         _validate_test_args(cfg, options.tests)
     if options.mode == "failed":
