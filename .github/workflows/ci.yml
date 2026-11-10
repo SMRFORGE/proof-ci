@@ -57,8 +57,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
-      - run: python -m pip install -e ".[dev]"
-      - run: python -m pytest -q
+      # The annotate plugin turns each failure into a public check annotation.
+      - run: python -m pip install -e ".[dev]" pytest-github-actions-annotate-failures
+      - run: python -m pytest -q -rf
 
   test-arm:
     # Evidence for the aarch64 "expected to work" claim; optional until green for a release.
@@ -69,5 +70,6 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: python -m pip install -e ".[dev]"
-      - run: python -m pytest -q
+      # The annotate plugin turns each failure into a public check annotation.
+      - run: python -m pip install -e ".[dev]" pytest-github-actions-annotate-failures
+      - run: python -m pytest -q -rf
