@@ -474,7 +474,9 @@ def test_ledger_replaces_last_tree_stub(demo: Path) -> None:
     stub = demo / ".proof-ci" / "last-tree-0000000000000000.txt"
     stub.parent.mkdir(parents=True, exist_ok=True)
     stub.write_text("x\n", encoding="utf-8")
-    cli.invoke(app, ["run", "tests/test_text.py", "--repo", str(demo)])
+    cli.invoke(
+        app, ["run", "--all", "--repo", str(demo)]
+    )  # an affected/all run honours the fallback
     assert not stub.exists()
     ledger = SavingsLedger(demo / ".proof-ci" / "savings.sqlite")
     assert ledger.last_tree("main") is not None

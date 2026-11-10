@@ -274,6 +274,17 @@ def _parse_imports(source: str) -> _Parsed | None:
                 parsed.absolute.extend(f"{node.module}.{n}" for n in names)
             elif node.level > 0:
                 parsed.relative.append((node.level, node.module, names))
+        elif isinstance(node, ast.Assign) and any(
+            isinstance(target, ast.Name) and target.id == "pytest_plugins"
+            for target in node.targets
+        ):
+            # pytest loads these modules like imports (usually from conftest.py).
+            values = (
+                node.value.elts if isinstance(node.value, (ast.List, ast.Tuple)) else [node.value]
+            )
+            parsed.absolute.extend(
+                v.value for v in values if isinstance(v, ast.Constant) and isinstance(v.value, str)
+            )
     return parsed
 
 
@@ -415,17 +426,9 @@ class ImportGraph:
         seen.discard(path)
         return seen
 
-    def affected_files(self, changed: Iterable[str]) -> set[str]:
-        """Changed files plus every transitive dependent, with dynamic-import conservatism."""
-        seeds = {c for c in changed if c.endswith(".py")}
-        extra: set[str] = set()
-        for x in seeds:
-            top = self._top_package(x)
-            for d in self.dynamic:
-                if is_test_file(d) or self._top_package(d) == top:
-                    extra.add(d)
+    def _dependents(self, seeds: Iterable[str]) -> set[str]:
         result: set[str] = set()
-        queue = deque(seeds | extra)
+        queue = deque(seeds)
         while queue:
             f = queue.popleft()
             if f in result:
@@ -433,6 +436,27 @@ class ImportGraph:
             result.add(f)
             queue.extend(self.rdeps.get(f, ()))
         return result
+
+    def affected_files(self, changed: Iterable[str]) -> set[str]:
+        """Changed files plus every transitive dependent, with dynamic-import conservatism."""
+        static, dynamic_only = self.affected_split(changed)
+        return static | dynamic_only
+
+    def affected_split(self, changed: Iterable[str]) -> tuple[set[str], set[str]]:
+        """(statically affected files, files affected only through the dynamic-import rule).
+
+        The second set matters to the result cache: those files do not have the changed
+        file in their import closure, so their cache key would not change.
+        """
+        seeds = {c for c in changed if c.endswith(".py")}
+        extra: set[str] = set()
+        for x in seeds:
+            top = self._top_package(x)
+            for d in self.dynamic:
+                if is_test_file(d) or self._top_package(d) == top:
+                    extra.add(d)
+        static = self._dependents(seeds)
+        return static, self._dependents(extra) - static
 
 
 # ---------------------------------------------- Steps 5-6: tests and data files
@@ -457,6 +481,8 @@ class Selection:
     affected_test_files: list[str]
     fallback: FallbackDecision
     unmatched_data_files: list[str]
+    no_cache_files: frozenset[str] = frozenset()
+    """Test files selected for a reason their cache key does not capture."""
 
 
 def select(
@@ -471,15 +497,21 @@ def select(
         files = sorted({f for _, f in collected})
         return Selection([t for t, _ in collected], files, fallback, [])
 
-    affected = graph.affected_files(changed)
+    static, dynamic_only = graph.affected_split(changed)
+    affected = static | dynamic_only
     test_files = {f for _, f in collected}
 
-    # Nested conftest.py: select every test under that directory (Step 3 special case).
-    for path in changed:
-        p = PurePosixPath(path)
-        if p.name == "conftest.py" and len(p.parts) > 1:
-            prefix = p.parent.as_posix() + "/"
-            affected |= {f for f in test_files if f.startswith(prefix)}
+    # A conftest.py is loaded for every test below it, so a conftest that is changed, or
+    # that imports something that changed, affects that whole subtree. A changed root
+    # conftest already fires the full-run fallback; an affected one selects everything.
+    conftests = {c for c in affected if PurePosixPath(c).name == "conftest.py"}
+    conftests |= {c for c in changed if PurePosixPath(c).name == "conftest.py"}
+    for conf in conftests:
+        parent = PurePosixPath(conf).parent.as_posix()
+        if parent in ("", "."):
+            affected |= test_files
+        else:
+            affected |= {f for f in test_files if f.startswith(parent + "/")}
 
     # Step 6: non-Python files referenced by a test file's text.
     unmatched: list[str] = []
@@ -507,7 +539,10 @@ def select(
 
     selected_files = sorted(f for f in test_files if f in affected)
     keep = set(selected_files)
-    return Selection([t for t, f in collected if f in keep], selected_files, fallback, unmatched)
+    no_cache = frozenset(f for f in selected_files if f in dynamic_only and f not in static)
+    return Selection(
+        [t for t, f in collected if f in keep], selected_files, fallback, unmatched, no_cache
+    )
 
 
 # ------------------------------------------------------------- likely cause

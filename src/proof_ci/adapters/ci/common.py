@@ -105,11 +105,13 @@ def pytest_argv(line: str) -> list[str] | None:
             continue
         for i, tok in enumerate(tokens):
             base = tok.rsplit("/", 1)[-1]
+            # Only the executable part: CI lines often carry paths and coverage flags
+            # that belong in [project].test_paths / pytest_args, not in the prefix.
             if base in ("pytest", "py.test"):
-                return ["pytest", *tokens[i + 1 :]]
+                return ["pytest"]
             if re.fullmatch(r"python3?(?:\.\d+)?", base) and tokens[i + 1 : i + 3] == [
                 "-m",
                 "pytest",
             ]:
-                return [base, "-m", "pytest", *tokens[i + 3 :]]
+                return [base, "-m", "pytest"]
     return None

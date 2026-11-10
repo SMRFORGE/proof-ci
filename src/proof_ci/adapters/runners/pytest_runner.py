@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from proof_ci._plugin_protocol import COLLECT_ENV, RESULTS_ENV, repro_command
+from proof_ci._redact_patterns import redact
 
 __all__ = ["CollectOutput", "PytestRunner", "RunOutput", "RunnerError"]
 
@@ -65,6 +66,7 @@ class RunOutput:
     stdout: str
     stderr: str
     argv: list[str] = field(default_factory=list)
+    installed: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -122,7 +124,7 @@ class PytestRunner:
             )
         else:
             message = f"pytest collection produced no proof-ci output (exit {proc.returncode}) for '{cmd}'"
-        return RunnerError(message + (f"\n{detail[-2000:]}" if detail else ""))
+        return RunnerError(message + (f"\n{redact(detail[-2000:])}" if detail else ""))
 
     def preflight(self) -> None:
         if self._preflighted:
@@ -141,7 +143,7 @@ class PytestRunner:
             raise RunnerError(f"cannot launch test_command {self.test_command!r}: {exc}") from exc
         if proc.returncode != 0:
             raise RunnerError(
-                f"'{' '.join(self.test_command)} --version' failed:\n{(proc.stderr or proc.stdout).strip()[-2000:]}"
+                f"'{' '.join(self.test_command)} --version' failed:\n{redact((proc.stderr or proc.stdout).strip()[-2000:])}"
             )
         self._preflighted = True
 
@@ -168,7 +170,7 @@ class PytestRunner:
         # pytest exit code 5 = no tests collected; 0 = ok. Others mean a collection error.
         if proc.returncode not in (0, 5):
             raise RunnerError(
-                f"pytest collection failed (exit {proc.returncode}):\n{(proc.stdout + proc.stderr).strip()[-4000:]}"
+                f"pytest collection failed (exit {proc.returncode}):\n{redact((proc.stdout + proc.stderr).strip()[-4000:])}"
             )
         return CollectOutput(
             python=str(data.get("python", "")),
@@ -190,11 +192,12 @@ class PytestRunner:
             raise RunnerError(
                 "pytest did not produce proof-ci results (the plugin did not load or pytest "
                 f"crashed before session finish; exit {proc.returncode}):\n"
-                + (proc.stderr or proc.stdout).strip()[-4000:]
+                + redact((proc.stderr or proc.stdout).strip()[-4000:])
             )
         return RunOutput(
             python=str(data.get("python", "")),
             platform=str(data.get("platform", "")),
+            installed=[str(x) for x in data.get("installed", [])],
             results=list(data.get("results", [])),
             returncode=proc.returncode,
             stdout=proc.stdout,

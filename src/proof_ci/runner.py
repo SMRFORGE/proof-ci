@@ -55,6 +55,7 @@ from proof_ci.models import (
     Selection,
     TestResult,
 )
+from proof_ci.redact import redact
 from proof_ci.savings import RunFacts, SavingsLedger, compute_savings, ledger_row
 from proof_ci.util import CaseIndex, GitError, GitInfo, debug, git_info, run_git, utc_now_iso
 
@@ -111,6 +112,22 @@ def _require_pytest_command(cfg: Config) -> None:
             'directly so its plugin loads. Set test_command = ["pytest"] or '
             '["python", "-m", "pytest"] (extra arguments are fine).'
         )
+    # Paths in the prefix would make pytest collect and run tests outside the selection.
+    root = cfg.repo_root.resolve()
+    start = (
+        1 if Path(cfg.project.test_command[0]).name.lower().startswith(("pytest", "py.test")) else 3
+    )
+    for arg in cfg.project.test_command[start:]:
+        if arg.startswith("-"):
+            continue
+        candidate = Path(arg.split("::", 1)[0])
+        if not candidate.is_absolute():
+            candidate = root / candidate
+        if candidate.exists():
+            raise ConfigError(
+                f"[project].test_command names the path {arg!r}; put test locations in "
+                "[project].test_paths (or pass TESTS) so selection controls what runs"
+            )
 
 
 def _validate_test_args(cfg: Config, tests: tuple[str, ...]) -> None:
@@ -217,6 +234,7 @@ class SelectionPlan:
     collect_entry: CollectEntry | None
     env: CollectEnv
     graph: ImportGraph | None = None
+    no_cache_files: set[str] = field(default_factory=set)
     notes: list[str] = field(default_factory=list)
 
 
@@ -322,6 +340,7 @@ def plan_selection(
     fallback = FallbackDecision(False, None)
     notes: list[str] = []
     graph: ImportGraph | None = None
+    no_cache_files: set[str] = set()
     if options.mode == "affected":
         tree_last = None
         if branch:
@@ -342,11 +361,20 @@ def plan_selection(
             cfg.repo_root, changed, [(t, item_file[t]) for t in collected_ids], graph, fallback
         )
         selected = chosen.selected
+        no_cache_files = set(chosen.no_cache_files)
         for path in chosen.unmatched_data_files:
             debug(f"changed non-Python file {path} is not referenced by any test file")
     elif options.mode == "failed":
         previous = set(_previous_failed(cfg))
         selected = [t for t in collected_ids if t in previous]
+        if not selected:
+            gone = sorted(previous - set(collected_ids))
+            notes.append(
+                "nothing to rerun: the previous run had no failures"
+                if not previous
+                else f"nothing to rerun: {len(gone)} previously failing test(s) no longer collect"
+                + (f" (e.g. {gone[0]})" if gone else "")
+            )
     else:
         selected = collected_ids
 
@@ -388,6 +416,7 @@ def plan_selection(
         collect_entry=entry,
         env=env,
         graph=graph,
+        no_cache_files=no_cache_files,
         notes=notes,
     )
 
@@ -434,7 +463,7 @@ def _check_run(out: RunOutput, ids: list[str], case: CaseIndex) -> None:
     if out.returncode in (2, 3, 4):
         raise RunError(
             f"pytest exited {out.returncode} (interrupted, internal or usage error):\n"
-            + (out.stdout + out.stderr)[-4000:]
+            + redact((out.stdout + out.stderr)[-4000:])
         )
     # Compare canonical ids: on case-insensitive filesystems pytest may report a node
     # id in the file's on-disk case rather than the spelling it was invoked with.
@@ -474,6 +503,11 @@ class _KeyBuilder:
                 test_file,
                 *self.graph.closure(test_file),
                 *conftest_chain(self.repo, test_file),
+                *(
+                    dep
+                    for conf in conftest_chain(self.repo, test_file)
+                    for dep in self.graph.closure(conf)
+                ),
             }
             try:
                 text = (self.repo / test_file).read_text(encoding="utf-8", errors="replace")
@@ -582,6 +616,7 @@ def _savings(
             selected_count=len(plan.selected),
             collected_count=len(plan.collected_ids),
             duration_ms=summary.duration_ms,
+            mode=plan.mode,
         )
     )
     return savings
@@ -633,6 +668,8 @@ def execute_run(cfg: Config, options: RunOptions) -> RunOutcome:
         for test_id in plan.selected:
             if cache_blocked_by_flakes(cfg, test_id, flakes_before):
                 continue
+            if plan.item_file[test_id] in plan.no_cache_files:
+                continue  # selected for a reason its cache key does not capture
             stored = result_cache.get(keys.key(test_id, plan.item_file[test_id], current))
             if stored is not None and stored.get("test_id") == test_id:
                 found[test_id] = TestResult.model_validate({**stored, "cache_hit": True})
@@ -646,6 +683,7 @@ def execute_run(cfg: Config, options: RunOptions) -> RunOutcome:
         out = runner.run([plan.invoke_id[t] for t in ids], extra)
         pytest_ms += round((time.monotonic() - started_pytest) * 1000)
         _check_run(out, ids, case)
+        wanted = set(ids)
         stdout_parts.append(out.stdout)
         for raw in out.results:
             data = _canonicalise(raw, case)
@@ -655,6 +693,8 @@ def execute_run(cfg: Config, options: RunOptions) -> RunOutcome:
                 cause = likely_cause(failure.get("traceback", ""), plan.hunks, base_ref)
                 if cause is not None:
                     data["failure"] = {**failure, "likely_cause": cause}
+            if data["test_id"] not in wanted:
+                continue  # e.g. paths in test_command made pytest run extra tests
             result = TestResult.model_validate(data)
             executed[result.test_id] = result
         return out
@@ -680,7 +720,12 @@ def execute_run(cfg: Config, options: RunOptions) -> RunOutcome:
         to_run = [t for t in plan.selected if t not in hits]
         if to_run:
             out = execute(to_run)
-            if (env.python, env.platform) != (out.python, out.platform):
+            live_installed = sorted(out.installed) if out.installed else sorted(env.installed)
+            if (env.python, env.platform, sorted(env.installed)) != (
+                out.python,
+                out.platform,
+                live_installed,
+            ):
                 # Environment consistency: the cached collection described another
                 # interpreter. Drop it, re-key with the live environment, and
                 # execute any hits that were served under the stale one.
@@ -718,7 +763,9 @@ def execute_run(cfg: Config, options: RunOptions) -> RunOutcome:
     ]
     pytest_stdout = "".join(stdout_parts)
     if stdout_parts:
-        (run_dir / "pytest-stdout.txt").write_text(pytest_stdout, encoding="utf-8", newline="\n")
+        (run_dir / "pytest-stdout.txt").write_text(
+            redact(pytest_stdout), encoding="utf-8", newline="\n"
+        )
 
     if cache_on and keys is not None:
         # Replayed hits are never re-written and never enter flake history
@@ -789,6 +836,11 @@ def execute_run(cfg: Config, options: RunOptions) -> RunOutcome:
             "0 selected, 0 failed (nothing affected)"
             if nothing_affected
             else _summary_text(counts, duration_ms, len(plan.selected))
+            + (
+                f"; {allowed_flaky} known-flaky failure(s) allowed"
+                if (allowed_flaky := counts.failed + counts.error - len(blocking))
+                else ""
+            )
         ),
         failures=failures,
         results_path=_rel(cfg, results_path),

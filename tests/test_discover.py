@@ -71,7 +71,7 @@ def test_github_extracts_run_steps(repo: Path) -> None:
 
 def test_best_is_shortest_unique_high_confidence(repo: Path) -> None:
     result = discover(repo, DiscoveryConfig())
-    assert result.best == ["pytest", "-q", "tests"]
+    assert result.best == ["pytest"]
     assert all(
         c.skipped_reason is None or c.command != "pytest -q smoke"
         for c in result.candidates
@@ -87,11 +87,11 @@ def test_nothing_found_without_ci_files(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     ("line", "argv"),
     [
-        ("pytest -q tests", ["pytest", "-q", "tests"]),
-        ("uv run pytest -x", ["pytest", "-x"]),
-        ("python3 -m pytest -q | tee log", ["python3", "-m", "pytest", "-q"]),
+        ("pytest -q tests", ["pytest"]),  # paths and flags stay out of the prefix
+        ("uv run pytest -x", ["pytest"]),
+        ("python3 -m pytest -q | tee log", ["python3", "-m", "pytest"]),
         ("cd sub && python -m pytest", ["python", "-m", "pytest"]),
-        ("COVERAGE=1 pytest --cov", ["pytest", "--cov"]),
+        ("COVERAGE=1 pytest --cov", ["pytest"]),
         ("tox -e py312", None),
         ("echo 'pytest is great'", None),
     ],
@@ -143,7 +143,7 @@ def test_discovery_never_spawns_processes(repo: Path, monkeypatch: pytest.Monkey
 
     monkeypatch.setattr(subprocess, "run", forbidden)
     monkeypatch.setattr(subprocess, "Popen", forbidden)
-    assert discover(repo, DiscoveryConfig()).best == ["pytest", "-q", "tests"]
+    assert discover(repo, DiscoveryConfig()).best == ["pytest"]
 
 
 def test_init_discover_writes_command(
@@ -154,9 +154,9 @@ def test_init_discover_writes_command(
     monkeypatch.setattr(cfg_mod, "user_config_dir", lambda: tmp_path / "keys")
     result = cli.invoke(app, ["init", "--discover", "--no-key", "--json", "--repo", str(repo)])
     assert result.exit_code == 0, result.output
-    assert json.loads(result.stdout)["discovered_command"] == ["pytest", "-q", "tests"]
+    assert json.loads(result.stdout)["discovered_command"] == ["pytest"]
     raw = tomllib.loads((repo / "proof-ci.toml").read_text(encoding="utf-8"))
-    assert raw["project"]["test_command"] == ["pytest", "-q", "tests"]
+    assert raw["project"]["test_command"] == ["pytest"]
 
 
 def test_init_discover_without_ci_keeps_default(tmp_path: Path) -> None:
@@ -173,7 +173,7 @@ def test_discover_cli_json(repo: Path) -> None:
     result = cli.invoke(app, ["discover", "--json", "--repo", str(repo)])
     assert result.exit_code == 0, result.output
     data = json.loads(result.stdout)
-    assert data["best"] == ["pytest", "-q", "tests"]
+    assert data["best"] == ["pytest"]
     assert {"command", "confidence", "source_path", "job_name", "skipped_reason"} <= set(
         data["candidates"][0]
     )

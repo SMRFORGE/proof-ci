@@ -393,7 +393,30 @@ def load_config(repo: Path | None = None, config: Path | None = None) -> Config:
     sections = {
         name: _build_section(name, cls, raw.get(name, {})) for name, cls in _SECTIONS.items()
     }
-    return Config(repo_root=repo_root, config_path=config_path, file_exists=exists, **sections)
+    result = Config(repo_root=repo_root, config_path=config_path, file_exists=exists, **sections)
+    _confine_state_paths(result)
+    return result
+
+
+def _confine_state_paths(cfg: Config) -> None:
+    """Cache and database paths must stay inside ``<repo>/.proof-ci/``.
+
+    A repository's proof-ci.toml is untrusted input: pointing the cache at a tracked
+    directory would let committed entries be served as results, and pointing a database
+    at another checkout would mix their histories.
+    """
+    state = (cfg.repo_root / ".proof-ci").resolve()
+    for name, value in (
+        ("[cache].dir", cfg.cache.dir),
+        ("[cache].collect_cache_dir", cfg.cache.collect_cache_dir),
+        ("[flakes].db", cfg.flakes.db),
+        ("[savings].db", cfg.savings.db),
+    ):
+        target = cfg.resolve(value).resolve()
+        if target != state and state not in target.parents:
+            raise ConfigError(
+                f"{name} = {value!r} must be inside the repository's .proof-ci/ directory"
+            )
 
 
 # --------------------------------------------------------------------------- init

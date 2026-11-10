@@ -24,6 +24,13 @@ PATTERNS: tuple[tuple[re.Pattern[str], int | None], ...] = (
         ),
         1,
     ),
+    (
+        re.compile(
+            r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|\Z)",
+            re.DOTALL,
+        ),
+        None,
+    ),
     (re.compile(r"AKIA[0-9A-Z]{16}"), None),
     (re.compile(r"ghp_[A-Za-z0-9]{20,}"), None),
     (re.compile(r"glpat-[A-Za-z0-9_\-]{20,}"), None),

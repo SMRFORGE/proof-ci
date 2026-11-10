@@ -407,10 +407,24 @@ _HANDLERS = {
 
 def call_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
     """Run one tool synchronously. Raises :class:`ToolError` for readable failures."""
+    import jsonschema
+
+    from proof_ci.redact import redact
+
     handler = _HANDLERS.get(name)
     if handler is None:
         raise ToolError(f"unknown tool {name!r}")
-    return handler(arguments)
+    schema = next(t["inputSchema"] for t in TOOLS if t["name"] == name)
+    try:
+        jsonschema.validate(arguments, schema)
+    except jsonschema.ValidationError as exc:
+        raise ToolError(f"invalid arguments for {name}: {exc.message}") from exc
+    try:
+        return handler(arguments)
+    except ToolError:
+        raise
+    except Exception as exc:  # never hand a raw traceback to the client
+        raise ToolError(redact(f"{name} failed: {type(exc).__name__}: {exc}")) from exc
 
 
 def tool_definitions() -> list[Any]:

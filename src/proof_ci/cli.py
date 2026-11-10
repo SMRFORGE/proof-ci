@@ -372,9 +372,17 @@ def run(
         typer.echo(f"Checked {sel.selected_count}/{sel.collected_count} tests.")
         if sel.fallback_full_run:
             typer.echo(sel.fallback_reason or "full run (fallback)")
+        flake_status = {r.test_id: r.flaky.status for r in outcome.results if r.flaky}
         for f in summary.failures:
             where = f"{f.file}:{f.line}" if f.line else f.file
-            label = "FAILED (known flaky)" if f.is_flaky else "FAILED"
+            status = flake_status.get(f.test_id, "none")
+            label = (
+                "FAILED (known flaky)"
+                if status in ("confirmed", "ignored")
+                else "FAILED (suspected flaky)"
+                if status == "suspected"
+                else "FAILED"
+            )
             typer.echo(f"{label} {f.test_id} ({where})")
             first = f.error_message.splitlines()[0] if f.error_message else ""
             typer.echo(f"  {f.error_type}: {first}")
@@ -585,6 +593,12 @@ def _record_output(cfg: Any, run_dir: Path, requested: Path | None) -> Path:
         rel = target.relative_to(root)
     except ValueError as exc:
         raise _SignFailure(f"{requested} resolves outside the repository", EXIT_USAGE) from exc
+    state = root / ".proof-ci"
+    if (target == state or state in target.parents) and (state / "runs") not in target.parents:
+        raise _SignFailure(
+            f"{requested} would overwrite proof-ci's own state; use .proof-ci/runs/<run_id>/",
+            EXIT_USAGE,
+        )
     from proof_ci.util import GitError, run_git
 
     try:

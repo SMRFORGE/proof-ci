@@ -142,6 +142,18 @@ class CollectEntry:
         return (time.time() - self.written_at) / 60
 
 
+def _valid_items(items: Any) -> list[dict[str, Any]]:
+    if not isinstance(items, list) or not all(
+        isinstance(i, dict)
+        and isinstance(i.get("test_id"), str)
+        and isinstance(i.get("file"), str)
+        and isinstance(i.get("line"), int)
+        for i in items
+    ):
+        raise ValueError("malformed collection entry")
+    return items
+
+
 class CollectCache:
     def __init__(self, directory: Path) -> None:
         self.directory = directory
@@ -158,7 +170,7 @@ class CollectCache:
                 platform=str(data["platform"]),
                 inipath=data.get("inipath"),
                 installed=list(data["installed"]),
-                items=list(data["items"]),
+                items=_valid_items(data["items"]),
                 written_at=float(data["written_at"]),
             )
         except (OSError, ValueError, KeyError, TypeError):
@@ -254,8 +266,14 @@ class ResultCache:
             data = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             return None
-        if not isinstance(data, dict):
-            return None
+        if not isinstance(data, dict) or data.get("outcome") not in CACHEABLE_OUTCOMES:
+            return None  # never replay a failure, whatever is on disk
+        try:
+            from proof_ci.models import TestResult
+
+            TestResult.model_validate(data)
+        except ValueError:
+            return None  # corrupt or hand-edited entry: treat as a miss
         try:
             os.utime(path)  # LRU: a hit counts as a use
         except OSError:

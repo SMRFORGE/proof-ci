@@ -148,13 +148,15 @@ class FlakeSnapshot:
         )
 
     def allowed_failure(self, test_id: str, current_code_hash: str | None) -> bool:
-        """``--allow-known-flakes``: confirmed/ignored only, on unchanged code."""
+        """``--allow-known-flakes``: confirmed/ignored only, and only on unchanged code.
+
+        Manual marks are pinned to a code hash too (at mark time, or on the test's next
+        run), so marking a test ``ignored`` cannot excuse a later regression.
+        """
         row = self.rows.get(test_id)
         if row is None or row.status not in ("confirmed", "ignored"):
             return False
-        return row.manual or (
-            current_code_hash is not None and current_code_hash == row.last_code_hash
-        )
+        return bool(row.last_code_hash) and current_code_hash == row.last_code_hash
 
 
 class FlakeStore:
@@ -343,6 +345,12 @@ class FlakeStore:
         ).fetchone()
         current = self._row(r) if r else None
         if current is not None and (current.manual or current.status == "ignored"):
+            if not current.last_code_hash:
+                # Pin a manual mark made before the test ever ran to the code it next runs on.
+                conn.execute(
+                    "UPDATE flake_records SET last_code_hash = ? WHERE test_id = ?",
+                    (latest_hash, test_id),
+                )
             return
         groups = self._groups(conn, test_id)
         if not groups:
@@ -419,13 +427,19 @@ class FlakeStore:
             raise ValueError("status must be confirmed or ignored")
         now = utc_now_iso()
         with self._connect() as conn:
+            latest = conn.execute(
+                "SELECT code_hash FROM test_outcomes WHERE test_id = ? "
+                "ORDER BY started_at DESC, id DESC LIMIT 1",
+                (test_id,),
+            ).fetchone()
+            pinned = str(latest[0]) if latest else ""
             conn.execute(
                 "INSERT INTO flake_records (test_id, status, first_seen, last_seen, last_code_hash, "
                 "pass_count, fail_count, flip_count, reason, updated_at, manual) "
-                "VALUES (?, ?, ?, ?, '', 0, 0, 0, ?, ?, 1) "
+                "VALUES (?, ?, ?, ?, ?, 0, 0, 0, ?, ?, 1) "
                 "ON CONFLICT(test_id) DO UPDATE SET status=excluded.status, reason=excluded.reason, "
-                "updated_at=excluded.updated_at, manual=1",
-                (test_id, status, now, now, reason or f"manually marked {status}", now),
+                "updated_at=excluded.updated_at, last_code_hash=excluded.last_code_hash, manual=1",
+                (test_id, status, now, now, pinned, reason or f"manually marked {status}", now),
             )
             r = conn.execute(
                 f"SELECT {self._COLS} FROM flake_records WHERE test_id = ?", (test_id,)

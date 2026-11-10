@@ -224,6 +224,11 @@ class SavingsLedger:
                 conn.execute("PRAGMA journal_mode = DELETE")
                 debug(f"{self.path}: WAL unavailable, using journal_mode=DELETE")
             conn.executescript(SCHEMA)
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(savings_ledger)")}
+            if "mode" not in columns:
+                # Which selection mode produced the row: only affected/all runs honour the
+                # full-run fallback, so only they may suppress it later (Section 5.8 Step 3).
+                conn.execute("ALTER TABLE savings_ledger ADD COLUMN mode TEXT")
             yield conn
             conn.commit()
         finally:
@@ -264,7 +269,7 @@ class SavingsLedger:
         with self._connect() as conn:
             r = conn.execute(
                 "SELECT commit_tree FROM savings_ledger WHERE branch = ? AND commit_tree IS NOT NULL "
-                "ORDER BY recorded_at DESC, id DESC LIMIT 1",
+                "AND mode IN ('affected', 'all') ORDER BY recorded_at DESC, id DESC LIMIT 1",
                 (branch,),
             ).fetchone()
         return str(r[0]) if r else None
@@ -721,6 +726,7 @@ def ledger_row(
     selected_count: int,
     collected_count: int,
     duration_ms: int,
+    mode: str | None = None,
 ) -> dict[str, Any]:
     t = savings.totals
     return {
@@ -748,6 +754,7 @@ def ledger_row(
         "defaults_used": json.dumps(savings.prices_used.defaults_used),
         "savings_json": json.dumps(savings.to_json(), ensure_ascii=False),
         "record_path": None,
+        "mode": mode,
     }
 
 

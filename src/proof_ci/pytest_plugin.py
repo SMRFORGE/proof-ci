@@ -163,6 +163,7 @@ class _Results:
             {
                 "python": platform.python_version(),
                 "platform": platform.system(),
+                "installed": _installed(),
                 "results": results,
             },
         )

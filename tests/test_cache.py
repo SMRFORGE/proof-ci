@@ -320,8 +320,31 @@ def test_lru_trim_across_result_and_collect_caches(tmp_path: Path) -> None:
 def test_hit_updates_mtime(tmp_path: Path) -> None:
     rc = ResultCache(tmp_path)
     key = "cd" * 32
-    rc.put(key, {"outcome": "passed", "test_id": "t"})
+    valid = {
+        "schema_version": "1.0.0",
+        "test_id": "tests/t.py::t",
+        "outcome": "passed",
+        "duration_ms": 1,
+        "location": {"file": "tests/t.py", "line": 1},
+        "cache_hit": False,
+    }
+    rc.put(key, valid)
     path = tmp_path / key[:2] / f"{key}.json"
     os.utime(path, (1000, 1000))
     assert rc.get(key) is not None
     assert path.stat().st_mtime > 1000
+
+
+def test_corrupt_or_failed_entries_are_misses(tmp_path: Path) -> None:
+    rc = ResultCache(tmp_path)
+    key = "ef" * 32
+    path = tmp_path / key[:2] / f"{key}.json"
+    path.parent.mkdir(parents=True)
+    for content in (
+        "not json",
+        "[]",
+        '{"outcome": "passed"}',
+        json.dumps({"outcome": "failed", "test_id": "t"}),
+    ):
+        path.write_text(content, encoding="utf-8")
+        assert rc.get(key) is None

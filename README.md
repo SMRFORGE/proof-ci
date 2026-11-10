@@ -270,6 +270,12 @@ Requires git 2.0 or newer.
   suggest `tox` or `make test`, but proof-ci will not execute them.
 - **Selection can under-select** when code is loaded dynamically or a data file is never named in a
   test. Selection runs more tests when unsure, but it is not complete.
+- **Some inputs are not tracked.** Environment variables are not part of the cache key, so a cached
+  pass is replayed even if a variable the test reads has changed (use `--no-cache`). A data file read
+  by source code, rather than named in a test file, selects nothing when it changes.
+- **The test process is trusted.** Tests and `conftest.py` run inside the same pytest process that
+  reports results, so hostile test code could report anything. A record states what proof-ci
+  reported; it cannot vouch for the test code itself.
 - **Redaction of secrets in captured output is best effort,** not a guarantee.
 - **Savings are estimates.** Local minutes are your machine's time, not CI time, and are unpriced by
   default. Token figures are measured against pytest's real output and are often negative on small
